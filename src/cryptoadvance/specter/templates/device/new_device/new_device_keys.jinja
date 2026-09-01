@@ -358,17 +358,17 @@
 
             try {
                 for (let xpubRow of pendingRows) {
-                    let xpub = await getXpub(device,
-                        document.getElementById(xpubRow.id + '-derivation').innerHTML,
-                        "",
-                        "{specter.chain}"
-                    );
+                    let derivation = document.getElementById(xpubRow.id + '-derivation').innerHTML;
+                    let xpub = await getXpub(device, derivation, "", "{specter.chain}");
                     if(xpub == null){
-                        showError(`{{ _("Failed to retrive device data. Please try again.") }}`);
+                        // getXpub() has already surfaced the specific reason
+                        // (e.g. "This Specter-DIY is on Mainnet - switch it to
+                        // Testnet") via handleHWIError; don't stack a generic
+                        // "failed, try again" on top of it.
                         return;
                     }
 
-                    addXpub('Custom', document.getElementById(xpubRow.id + '-derivation').innerHTML, xpub)
+                    addXpub('Custom', derivation, xpub)
                 }
             } finally {
                 if (xpubAuthorized) {

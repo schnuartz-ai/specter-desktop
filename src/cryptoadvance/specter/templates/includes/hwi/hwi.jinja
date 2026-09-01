@@ -58,6 +58,12 @@
         if(error.message !== undefined){
             error = error.message;
         }
+        if(typeof error === 'string'){
+            // the JSON-RPC layer wraps every failure as "Internal error: <msg>." -
+            // unhelpful for the user-actionable ones (e.g. "switch the device to
+            // Testnet"), and it doubles the trailing period. Strip both.
+            error = error.replace(/^Internal error:\s*/, '').replace(/\.\.$/, '.');
+        }
         showError(error, 10000);
         if(overlayIsActive()){
             hidePageOverlay();
