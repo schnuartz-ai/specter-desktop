@@ -75,6 +75,8 @@ class HWIBridge(JSONRPC):
             "send_pin": self.send_pin,
             "extract_xpub": self.extract_xpub,
             "extract_xpubs": self.extract_xpubs,
+            "begin_xpub_authorization": self.begin_xpub_authorization,
+            "end_xpub_authorization": self.end_xpub_authorization,
             "display_address": self.display_address,
             "sign_tx": self.sign_tx,
             "sign_message": self.sign_message,
@@ -272,6 +274,68 @@ class HWIBridge(JSONRPC):
                     f"Failed to import Nested Segwit singlesig mainnet key. Error: {e}"
                 )
                 logger.exception(e)
+
+    @locked(hwilock)
+    def begin_xpub_authorization(
+        self,
+        paths=None,
+        device_type=None,
+        path=None,
+        fingerprint=None,
+        passphrase="",
+        chain="",
+    ):
+        """
+        Ask the device to authorize a whole set of xpub derivation ``paths``
+        (all on the same network) with a single on-device confirmation,
+        instead of one per subsequent extract_xpub() call. Currently only
+        Specter-DIY supports this.
+
+        Returns True if the device accepted the scope, False if this
+        device/firmware doesn't support it or rejected it (e.g. wrong
+        network) - callers should then just fall back to plain
+        extract_xpub() calls, which work either way. A cancellation on the
+        device propagates as an error, same as any other HWI call.
+        """
+        if not paths:
+            return False
+        with self._get_client(
+            device_type=device_type,
+            fingerprint=fingerprint,
+            path=path,
+            passphrase=passphrase,
+            chain=chain,
+        ) as client:
+            der = bip32.parse_path(paths[0])
+            client.chain = (
+                Chain.TEST if len(der) > 2 and der[1] == 0x80000001 else Chain.MAIN
+            )
+            begin = getattr(client, "begin_xpub_authorization", None)
+            if begin is None:
+                return False
+            return begin(paths)
+
+    @locked(hwilock)
+    def end_xpub_authorization(
+        self,
+        device_type=None,
+        path=None,
+        fingerprint=None,
+        passphrase="",
+        chain="",
+    ):
+        """Release any xpub authorization left active on the device (best effort)."""
+        with self._get_client(
+            device_type=device_type,
+            fingerprint=fingerprint,
+            path=path,
+            passphrase=passphrase,
+            chain=chain,
+        ) as client:
+            end = getattr(client, "end_xpub_authorization", None)
+            if end is not None:
+                end()
+        return True
 
     @locked(hwilock)
     def display_address(

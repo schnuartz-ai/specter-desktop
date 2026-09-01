@@ -203,6 +203,37 @@
         return result;
     }
 
+    async function beginXpubAuthorization(device, paths, passphrase="", chain=""){
+        // Ask the device to authorize a whole set of xpub paths (same
+        // network) with a single confirmation, instead of one per
+        // subsequent getXpub() call. Only some devices (Specter-DIY)
+        // support this; returns false (no error, no overlay) otherwise -
+        // callers should just proceed with individual getXpub() calls.
+        showHWIProgress(`{{ _("Requesting access to public keys...") }}`,
+            `{{ _("It may take a while.") }}<br><br>{{ _("Keep your") }} ${capitalize(device.type)} {{ _("connected") }}.`);
+        let authorized = false;
+        try {
+            authorized = await hwi.beginXpubAuthorization(device, paths, passphrase, chain);
+        } catch (error) {
+            // a real error (e.g. the user cancelled on the device) - not
+            // "unsupported", which resolves to false without throwing
+            handleHWIError(error);
+            return false;
+        }
+        hidePageOverlay();
+        return authorized;
+    }
+
+    async function endXpubAuthorization(device, passphrase="", chain=""){
+        try {
+            await hwi.endXpubAuthorization(device, passphrase, chain);
+        } catch (error) {
+            // best effort - the authorization also self-expires on the
+            // device, so a failure to explicitly release it isn't fatal
+            console.warn("endXpubAuthorization failed:", error);
+        }
+    }
+
     async function getMasterBlindingKey(device, passphrase="", chain=""){
         // detect device
         showHWIProgress(`{{ _("Extracting master blinding key...") }}`, 

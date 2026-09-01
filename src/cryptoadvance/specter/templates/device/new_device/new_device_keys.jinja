@@ -338,23 +338,42 @@
             }
 
             let xpubsTable = document.getElementById('xpubs_table');
-            
-            for (let xpubRow of [].slice.call(xpubsTable.children, 0, xpubsTable.children.length - 3)) {
-                if (document.getElementById(xpubRow.id + '-xpub').childNodes[0].innerHTML != '-') {
-                    continue
-                }
 
-                let xpub = await getXpub(device,
-                    document.getElementById(xpubRow.id + '-derivation').innerHTML,
-                    "",
-                    "{specter.chain}"
+            let pendingRows = [].slice.call(xpubsTable.children, 0, xpubsTable.children.length - 3)
+                .filter(xpubRow => document.getElementById(xpubRow.id + '-xpub').childNodes[0].innerHTML == '-');
+
+            // Some devices (Specter-DIY) ask for an on-device confirmation
+            // for every single key below. Ask for one confirmation covering
+            // the whole set up front instead - getXpub() below then returns
+            // without a further prompt for each authorized derivation.
+            // Devices/firmware that don't support this just return false
+            // here and the loop falls back to its normal per-key prompts.
+            let xpubAuthorized = false;
+            if (pendingRows.length > 0) {
+                let pendingDerivations = pendingRows.map(
+                    xpubRow => document.getElementById(xpubRow.id + '-derivation').innerHTML
                 );
-                if(xpub == null){
-                    showError(`{{ _("Failed to retrive device data. Please try again.") }}`);
-                    return;
-                }
+                xpubAuthorized = await beginXpubAuthorization(device, pendingDerivations, "", "{specter.chain}");
+            }
 
-                addXpub('Custom', document.getElementById(xpubRow.id + '-derivation').innerHTML, xpub)
+            try {
+                for (let xpubRow of pendingRows) {
+                    let xpub = await getXpub(device,
+                        document.getElementById(xpubRow.id + '-derivation').innerHTML,
+                        "",
+                        "{specter.chain}"
+                    );
+                    if(xpub == null){
+                        showError(`{{ _("Failed to retrive device data. Please try again.") }}`);
+                        return;
+                    }
+
+                    addXpub('Custom', document.getElementById(xpubRow.id + '-derivation').innerHTML, xpub)
+                }
+            } finally {
+                if (xpubAuthorized) {
+                    await endXpubAuthorization(device, "", "{specter.chain}");
+                }
             }
         });
     </script>
