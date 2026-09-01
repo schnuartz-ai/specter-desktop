@@ -347,13 +347,21 @@
             // the whole set up front instead - getXpub() below then returns
             // without a further prompt for each authorized derivation.
             // Devices/firmware that don't support this just return false
-            // here and the loop falls back to its normal per-key prompts.
+            // here and the loop falls back to its normal per-key prompts;
+            // an explicit Cancel on the device throws, and must abort the
+            // whole import rather than fall through to per-key prompts.
             let xpubAuthorized = false;
             if (pendingRows.length > 0) {
                 let pendingDerivations = pendingRows.map(
                     xpubRow => document.getElementById(xpubRow.id + '-derivation').innerHTML
                 );
-                xpubAuthorized = await beginXpubAuthorization(device, pendingDerivations, "", "{specter.chain}");
+                try {
+                    xpubAuthorized = await beginXpubAuthorization(device, pendingDerivations, "", "{specter.chain}");
+                } catch (error) {
+                    // beginXpubAuthorization() already showed the reason
+                    // (cancelled / device error). A "no" ends it here.
+                    return;
+                }
             }
 
             try {

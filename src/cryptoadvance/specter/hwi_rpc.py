@@ -301,9 +301,33 @@ class HWIBridge(JSONRPC):
         network) - callers should then just fall back to plain
         extract_xpub() calls, which work either way. A cancellation on the
         device propagates as an error, same as any other HWI call.
+
+        Lifecycle note: begin_xpub_authorization / end_xpub_authorization
+        are separate RPCs, and the HWI connection is reopened per call, so
+        between them the authorization lives on the device on its own. It
+        is deliberately narrow - RAM only, bound to the current network,
+        limited to the exact confirmed paths, each consumable once, and
+        dropped by the firmware on lock / re-init / network change. The
+        residual exposure is: if the host process dies mid-batch, the
+        still-unread authorized paths stay authorized until one of those
+        events. Acceptable given the one-shot scope; a fully atomic
+        server-side begin->reads->end (an extract_xpub_batch RPC) and/or a
+        short firmware TTL for unused authorizations would close it and
+        are worth a follow-up. The self-contained _extract_xpubs_from_
+        client() path already wraps begin/end in try/finally within one
+        RPC; only the new_device_keys.jinja "Get via USB" flow spans
+        several.
         """
         if not paths:
             return False
+        # Don't trust the caller (the browser builds this list from DOM
+        # text, including user-entered custom derivations) to hand us
+        # clean BIP32 paths. Parse and re-serialise each one canonically
+        # here, at the RPC boundary, before it's joined into the firmware
+        # scope string - a stray ";" or range expression must not be able
+        # to ride in through a single list entry and widen the scope.
+        ders = [bip32.parse_path(p) for p in paths]
+        norm_paths = [bip32.path_to_str(d) for d in ders]
         with self._get_client(
             device_type=device_type,
             fingerprint=fingerprint,
@@ -311,14 +335,14 @@ class HWIBridge(JSONRPC):
             passphrase=passphrase,
             chain=chain,
         ) as client:
-            der = bip32.parse_path(paths[0])
+            der = ders[0]
             client.chain = (
                 Chain.TEST if len(der) > 2 and der[1] == 0x80000001 else Chain.MAIN
             )
             begin = getattr(client, "begin_xpub_authorization", None)
             if begin is None:
                 return False
-            return begin(paths)
+            return begin(norm_paths)
 
     @locked(hwilock)
     def end_xpub_authorization(

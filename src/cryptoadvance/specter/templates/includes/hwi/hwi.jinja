@@ -58,10 +58,12 @@
         if(error.message !== undefined){
             error = error.message;
         }
-        if(typeof error === 'string'){
-            // the JSON-RPC layer wraps every failure as "Internal error: <msg>." -
-            // unhelpful for the user-actionable ones (e.g. "switch the device to
-            // Testnet"), and it doubles the trailing period. Strip both.
+        if(typeof error === 'string' && error.indexOf('This Specter-DIY is currently set to') !== -1){
+            // Only this one message: it's a full user-actionable sentence
+            // ("...Switch the device to Mainnet and try again."), but the
+            // JSON-RPC layer wraps every -32000 error as "Internal error:
+            // <msg>." so it reads like a crash and gets a doubled period.
+            // Left untouched for every other device/error.
             error = error.replace(/^Internal error:\s*/, '').replace(/\.\.$/, '.');
         }
         showError(error, 10000);
@@ -212,19 +214,23 @@
     async function beginXpubAuthorization(device, paths, passphrase="", chain=""){
         // Ask the device to authorize a whole set of xpub paths (same
         // network) with a single confirmation, instead of one per
-        // subsequent getXpub() call. Only some devices (Specter-DIY)
-        // support this; returns false (no error, no overlay) otherwise -
-        // callers should just proceed with individual getXpub() calls.
+        // subsequent getXpub() call.
+        //
+        // Returns false when the device/firmware doesn't support this or
+        // rejected the scope (wrong network) - the RPC resolves to false
+        // without throwing, and the caller should fall back to individual
+        // getXpub() calls. Anything that *throws* here is a real failure
+        // or an explicit on-device Cancel: the toast is shown and the
+        // error re-raised so the caller aborts the whole operation
+        // instead of silently continuing with per-key prompts.
         showHWIProgress(`{{ _("Requesting access to public keys...") }}`,
             `{{ _("It may take a while.") }}<br><br>{{ _("Keep your") }} ${capitalize(device.type)} {{ _("connected") }}.`);
         let authorized = false;
         try {
             authorized = await hwi.beginXpubAuthorization(device, paths, passphrase, chain);
         } catch (error) {
-            // a real error (e.g. the user cancelled on the device) - not
-            // "unsupported", which resolves to false without throwing
             handleHWIError(error);
-            return false;
+            throw error;
         }
         hidePageOverlay();
         return authorized;

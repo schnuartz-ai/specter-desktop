@@ -12,7 +12,8 @@
 import logging
 import io
 import pytest
-from unittest.mock import MagicMock
+from contextlib import contextmanager
+from unittest.mock import MagicMock, patch
 
 from hwilib.common import Chain
 from hwilib.errors import ActionCanceledError
@@ -22,17 +23,24 @@ from cryptoadvance.specter.key import Key
 from cryptoadvance.specter.util.descriptor import Descriptor
 
 
+# A real, base58check-valid xpub. convert_xpub_prefix() runs
+# base58.decode_check() on whatever to_string() returns and re-encodes it
+# with the slip132 prefix, so this has to actually decode - a "looks like
+# an xpub" placeholder silently fails that conversion, _extract_xpubs_from_
+# client() swallows the per-key exception, and the test then asserts only
+# on which *paths* were requested while zero keys actually came back.
+_VALID_XPUB = (
+    "xpub661MyMwAqRbcEwCMnGLoVvi19EZQaXijFpNzxCgpC4Cs1onmKcddCwMH6P8DicQYDm"
+    "GjAcu5pNNciH3m5CFuZq2LmdNM4EYK9bqY5BFimfo"
+)
+
+
 class _FakeExtKey:
     def __init__(self, path):
         self._path = path
 
     def to_string(self):
-        # a valid-looking xpub is required by convert_xpub_prefix; the exact
-        # value doesn't matter for these tests, only which path produced it
-        return (
-            "xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDf"
-            "Vxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz#" + self._path
-        )
+        return _VALID_XPUB
 
 
 class _FakeDiyClient:
@@ -87,9 +95,14 @@ def _paths_requested(client):
     return [p for kind, p in client.calls if kind == "xpub"]
 
 
+def _key_lines(result):
+    """The '[fpr/derivation]xpub' lines actually returned to the caller."""
+    return [ln for ln in result.split("\n") if ln.strip()]
+
+
 def test_extract_xpubs_mainnet_diy_confirms_once_and_skips_testnet():
     client = _FakeDiyClient("main")
-    HWIBridge(skip_hwi_initialisation=True)._extract_xpubs_from_client(client)
+    result = HWIBridge(skip_hwi_initialisation=True)._extract_xpubs_from_client(client)
 
     kinds = [k for k, _ in client.calls]
     assert kinds.count("begin") == 1  # single scoped confirmation
@@ -102,10 +115,25 @@ def test_extract_xpubs_mainnet_diy_confirms_once_and_skips_testnet():
         "m/48h/0h/0h/2h",
     ]  # only the network the device is on, no testnet requests
 
+    # and the keys actually came back, one line per requested path, with
+    # the slip132 prefix conversion applied (not swallowed as an error)
+    lines = _key_lines(result)
+    assert len(lines) == 4
+    assert [ln.split("]")[0] + "]" for ln in lines] == [
+        "[00000000/49'/0'/0']",
+        "[00000000/84'/0'/0']",
+        "[00000000/48'/0'/0'/1']",
+        "[00000000/48'/0'/0'/2']",
+    ]
+    assert lines[0].split("]")[1].startswith("ypub")
+    assert lines[1].split("]")[1].startswith("zpub")
+    assert lines[2].split("]")[1].startswith("Ypub")
+    assert lines[3].split("]")[1].startswith("Zpub")
+
 
 def test_extract_xpubs_testnet_diy_confirms_once_and_skips_mainnet():
     client = _FakeDiyClient("test")
-    HWIBridge(skip_hwi_initialisation=True)._extract_xpubs_from_client(client)
+    result = HWIBridge(skip_hwi_initialisation=True)._extract_xpubs_from_client(client)
 
     assert _paths_requested(client) == [
         "m/49h/1h/0h",
@@ -113,11 +141,23 @@ def test_extract_xpubs_testnet_diy_confirms_once_and_skips_mainnet():
         "m/48h/1h/0h/1h",
         "m/48h/1h/0h/2h",
     ]
+    lines = _key_lines(result)
+    assert len(lines) == 4
+    assert [ln.split("]")[0] + "]" for ln in lines] == [
+        "[00000000/49'/1'/0']",
+        "[00000000/84'/1'/0']",
+        "[00000000/48'/1'/0'/1']",
+        "[00000000/48'/1'/0'/2']",
+    ]
+    assert lines[0].split("]")[1].startswith("upub")
+    assert lines[1].split("]")[1].startswith("vpub")
+    assert lines[2].split("]")[1].startswith("Upub")
+    assert lines[3].split("]")[1].startswith("Vpub")
 
 
 def test_extract_xpubs_without_batch_auth_still_fetches_both_networks():
     client = _FakePlainClient()
-    HWIBridge(skip_hwi_initialisation=True)._extract_xpubs_from_client(client)
+    result = HWIBridge(skip_hwi_initialisation=True)._extract_xpubs_from_client(client)
 
     assert _paths_requested(client) == [
         "m/49h/0h/0h",
@@ -129,6 +169,7 @@ def test_extract_xpubs_without_batch_auth_still_fetches_both_networks():
         "m/48h/1h/0h/1h",
         "m/48h/1h/0h/2h",
     ]
+    assert len(_key_lines(result)) == 8  # all 8 keys converted and returned
 
 
 def test_extract_xpubs_diy_cancellation_propagates():
@@ -137,6 +178,26 @@ def test_extract_xpubs_diy_cancellation_propagates():
     with pytest.raises(ActionCanceledError):
         HWIBridge(skip_hwi_initialisation=True)._extract_xpubs_from_client(client)
     assert ("close", None) in client.calls  # client still cleaned up
+
+
+@contextmanager
+def _fake_client_cm(client):
+    yield client
+
+
+def test_begin_xpub_authorization_rejects_a_non_bip32_path():
+    bridge = HWIBridge(skip_hwi_initialisation=True)
+    with pytest.raises(Exception):
+        # never reaches the device - parsed and rejected at the RPC boundary
+        bridge.begin_xpub_authorization(paths=["m/49h/0h/0h;m/84h/0h/0h"])
+
+
+def test_begin_xpub_authorization_normalises_paths_before_the_device_sees_them():
+    bridge = HWIBridge(skip_hwi_initialisation=True)
+    client = _FakeDiyClient("main")
+    with patch.object(bridge, "_get_client", return_value=_fake_client_cm(client)):
+        bridge.begin_xpub_authorization(paths=["m/49'/0'/0'", "m/84h/0h/0h"])
+    assert client.calls[0] == ("begin", ["m/49h/0h/0h", "m/84h/0h/0h"])
 
 
 @pytest.mark.skip()
