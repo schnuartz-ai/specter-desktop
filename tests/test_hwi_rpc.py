@@ -12,9 +12,131 @@
 import logging
 import io
 import pytest
+from unittest.mock import MagicMock
+
+from hwilib.common import Chain
+from hwilib.errors import ActionCanceledError
+
 from cryptoadvance.specter.hwi_rpc import HWIBridge
 from cryptoadvance.specter.key import Key
 from cryptoadvance.specter.util.descriptor import Descriptor
+
+
+class _FakeExtKey:
+    def __init__(self, path):
+        self._path = path
+
+    def to_string(self):
+        # a valid-looking xpub is required by convert_xpub_prefix; the exact
+        # value doesn't matter for these tests, only which path produced it
+        return (
+            "xpub6CUGRUonZSQ4TWtTMmzXdrXDtypWKiKrhko4egpiMZbpiaQL2jkwSB1icqYh2cfDf"
+            "Vxdx4df189oLKnC5fSwqPfgyP3hooxujYzAu3fDVmz#" + self._path
+        )
+
+
+class _FakeDiyClient:
+    """Minimal stand-in for SpecterClient with the batch-auth API."""
+
+    def __init__(self, network):
+        # network the (fake) device is currently on: "main" or "test"
+        self._network = network
+        self.chain = Chain.MAIN
+        self.calls = []
+
+    def get_master_fingerprint(self):
+        return bytes.fromhex("00000000")
+
+    def begin_xpub_authorization(self, paths):
+        self.calls.append(("begin", list(paths)))
+        coin = "0h" if self._network == "main" else "1h"
+        if all("/%s/" % coin in p or p.endswith("/%s" % coin) for p in paths):
+            return True
+        return False  # scope for the other network -> rejected
+
+    def end_xpub_authorization(self):
+        self.calls.append(("end", None))
+
+    def get_pubkey_at_path(self, path):
+        self.calls.append(("xpub", path))
+        return _FakeExtKey(path)
+
+    def close(self):
+        self.calls.append(("close", None))
+
+
+class _FakePlainClient:
+    """Stand-in for a client without the batch-auth API (e.g. Trezor)."""
+
+    def __init__(self):
+        self.chain = Chain.MAIN
+        self.calls = []
+
+    def get_master_fingerprint(self):
+        return bytes.fromhex("00000000")
+
+    def get_pubkey_at_path(self, path):
+        self.calls.append(("xpub", path))
+        return _FakeExtKey(path)
+
+    def close(self):
+        self.calls.append(("close", None))
+
+
+def _paths_requested(client):
+    return [p for kind, p in client.calls if kind == "xpub"]
+
+
+def test_extract_xpubs_mainnet_diy_confirms_once_and_skips_testnet():
+    client = _FakeDiyClient("main")
+    HWIBridge(skip_hwi_initialisation=True)._extract_xpubs_from_client(client)
+
+    kinds = [k for k, _ in client.calls]
+    assert kinds.count("begin") == 1  # single scoped confirmation
+    assert ("end", None) in client.calls
+    paths = _paths_requested(client)
+    assert paths == [
+        "m/49h/0h/0h",
+        "m/84h/0h/0h",
+        "m/48h/0h/0h/1h",
+        "m/48h/0h/0h/2h",
+    ]  # only the network the device is on, no testnet requests
+
+
+def test_extract_xpubs_testnet_diy_confirms_once_and_skips_mainnet():
+    client = _FakeDiyClient("test")
+    HWIBridge(skip_hwi_initialisation=True)._extract_xpubs_from_client(client)
+
+    assert _paths_requested(client) == [
+        "m/49h/1h/0h",
+        "m/84h/1h/0h",
+        "m/48h/1h/0h/1h",
+        "m/48h/1h/0h/2h",
+    ]
+
+
+def test_extract_xpubs_without_batch_auth_still_fetches_both_networks():
+    client = _FakePlainClient()
+    HWIBridge(skip_hwi_initialisation=True)._extract_xpubs_from_client(client)
+
+    assert _paths_requested(client) == [
+        "m/49h/0h/0h",
+        "m/84h/0h/0h",
+        "m/48h/0h/0h/1h",
+        "m/48h/0h/0h/2h",
+        "m/49h/1h/0h",
+        "m/84h/1h/0h",
+        "m/48h/1h/0h/1h",
+        "m/48h/1h/0h/2h",
+    ]
+
+
+def test_extract_xpubs_diy_cancellation_propagates():
+    client = _FakeDiyClient("main")
+    client.begin_xpub_authorization = MagicMock(side_effect=ActionCanceledError("nope"))
+    with pytest.raises(ActionCanceledError):
+        HWIBridge(skip_hwi_initialisation=True)._extract_xpubs_from_client(client)
+    assert ("close", None) in client.calls  # client still cleaned up
 
 
 @pytest.mark.skip()

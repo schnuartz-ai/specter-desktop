@@ -101,6 +101,55 @@ class SpecterClient(HardwareWalletClient):
         )
         return hd
 
+    def begin_xpub_authorization(self, paths) -> bool:
+        """
+        Authorize a whole set of xpub derivation paths with a *single*
+        on-device confirmation instead of one Confirm per
+        ``get_pubkey_at_path()`` call.
+
+        Uses the Specter-DIY ``xpubauth begin <scope>`` protocol: after one
+        approval, ``xpub <derivation>`` requests that fall inside the
+        approved scope are answered without a further prompt (each
+        authorized path exactly once). Call :meth:`end_xpub_authorization`
+        when done.
+
+        Returns ``True`` when the device authorized the scope, ``False``
+        when the firmware is too old to know ``xpubauth`` or rejected the
+        scope. The device only authorizes a scope for the network it is
+        currently on, so a ``False`` for one network's standard paths is
+        also the signal that the device is on a *different* network -
+        callers can use that instead of blindly asking for both.
+
+        Raises ``ActionCanceledError`` if the user declined on the device.
+        All ``paths`` must belong to the same network.
+        """
+        if not paths:
+            return False
+        try:
+            # no timeout: waits for the user to Confirm/Cancel on the device
+            self.query("xpubauth begin %s" % ";".join(paths))
+            return True
+        except UnavailableActionError:
+            logger.info(
+                "Specter-DIY firmware without 'xpubauth' support - "
+                "falling back to per-xpub confirmation"
+            )
+            return False
+        except BadArgumentError as e:
+            logger.info(
+                "Specter-DIY did not authorize the xpubauth scope (%s) - "
+                "falling back to per-xpub confirmation",
+                e,
+            )
+            return False
+
+    def end_xpub_authorization(self) -> None:
+        """Discard any active ``xpubauth`` authorization (best effort)."""
+        try:
+            self.query("xpubauth end")
+        except Exception as e:
+            logger.debug("xpubauth end failed: %s", e)
+
     def sign_b64psbt(self, psbt: str) -> str:
         # works with both PSBT and PSET
         return self.query("sign %s" % psbt)

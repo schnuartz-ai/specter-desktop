@@ -6,12 +6,20 @@ returning an xpub, so get_pubkey_at_path() must not impose the old 3-second
 response timeout (it should wait indefinitely, like sign_tx() already does).
 get_master_fingerprint() stays non-interactive and keeps its short timeout.
 
+The same firmware also offers `xpubauth begin <scope>` / `xpubauth end` to
+authorize a whole set of derivation paths with a single confirmation;
+begin_xpub_authorization() wraps that, reports whether the device took the
+scope, and degrades gracefully on older firmware.
+
 These are pure unit tests against a mocked transport - no bitcoind, no real
 device, no network required.
 """
+
 from unittest.mock import MagicMock
 
+import pytest
 from hwilib.common import Chain
+from hwilib.errors import ActionCanceledError
 
 from cryptoadvance.specter.devices.hwi.specter_diy import SpecterClient
 
@@ -24,6 +32,15 @@ def _client_with_mocked_transport():
     return client
 
 
+def _timeout_of(call):
+    args, kwargs = call
+    return kwargs.get("timeout", args[1] if len(args) > 1 else None)
+
+
+def _sent(client):
+    return [c.args[0] for c in client.dev.query.call_args_list]
+
+
 def test_get_pubkey_at_path_does_not_pass_a_timeout():
     client = _client_with_mocked_transport()
     client.dev.query.return_value = (
@@ -31,16 +48,61 @@ def test_get_pubkey_at_path_does_not_pass_a_timeout():
         "shSCLtQ4pnyNSSVUXQfP7yzzKcVXBEeejuSsn7q"
     )
     client.get_pubkey_at_path("m/84h/0h/0h")
-    args, kwargs = client.dev.query.call_args
     # positional call: self.dev.query(data, timeout) - the timeout arg
     # (positional or via kwarg) must be None, i.e. "wait indefinitely"
-    passed_timeout = kwargs.get("timeout", args[1] if len(args) > 1 else None)
-    assert passed_timeout is None
+    assert _timeout_of(client.dev.query.call_args) is None
 
 
 def test_get_master_fingerprint_keeps_bounded_timeout():
     client = _client_with_mocked_transport()
     client.get_master_fingerprint()
-    args, kwargs = client.dev.query.call_args
-    passed_timeout = kwargs.get("timeout", args[1] if len(args) > 1 else None)
-    assert passed_timeout == SpecterClient.TIMEOUT
+    assert _timeout_of(client.dev.query.call_args) == SpecterClient.TIMEOUT
+
+
+def test_begin_xpub_authorization_sends_one_scoped_request_and_waits():
+    client = _client_with_mocked_transport()
+    client.dev.query.return_value = "success"
+
+    authorized = client.begin_xpub_authorization(
+        ["m/49h/0h/0h", "m/84h/0h/0h", "m/48h/0h/0h/2h"]
+    )
+
+    assert authorized is True
+    # one begin, every path joined by ";", and no response timeout
+    assert _sent(client) == ["xpubauth begin m/49h/0h/0h;m/84h/0h/0h;m/48h/0h/0h/2h"]
+    assert _timeout_of(client.dev.query.call_args) is None
+
+
+def test_end_xpub_authorization_sends_end():
+    client = _client_with_mocked_transport()
+    client.dev.query.return_value = "success"
+    client.end_xpub_authorization()
+    assert _sent(client) == ["xpubauth end"]
+
+
+def test_begin_xpub_authorization_returns_false_on_firmware_without_xpubauth():
+    client = _client_with_mocked_transport()
+    client.dev.query.return_value = "error: Unknown command xpubauth"
+    assert client.begin_xpub_authorization(["m/84h/0h/0h"]) is False
+
+
+def test_begin_xpub_authorization_returns_false_when_scope_is_rejected():
+    client = _client_with_mocked_transport()
+    # e.g. the scope's coin type doesn't match the device's active network
+    client.dev.query.return_value = (
+        "error: Scope entry does not match the active network (main): m/84h/1h/0h"
+    )
+    assert client.begin_xpub_authorization(["m/84h/1h/0h"]) is False
+
+
+def test_begin_xpub_authorization_propagates_a_cancellation():
+    client = _client_with_mocked_transport()
+    client.dev.query.return_value = "error: User cancelled"
+    with pytest.raises(ActionCanceledError):
+        client.begin_xpub_authorization(["m/84h/0h/0h"])
+
+
+def test_begin_xpub_authorization_noop_for_empty_paths():
+    client = _client_with_mocked_transport()
+    assert client.begin_xpub_authorization([]) is False
+    client.dev.query.assert_not_called()
