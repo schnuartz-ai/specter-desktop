@@ -16,7 +16,7 @@ from usb1 import USBError
 
 from .devices import __all__ as device_classes
 from .devices.hwi.jade import JadeClient
-from .devices.hwi.specter_diy import SpecterClient
+from .devices.hwi.specter_diy import SpecterClient, SpecterDIYNetworkMismatchError
 from .helpers import (
     deep_update,
     hwi_get_config,
@@ -269,6 +269,11 @@ class HWIBridge(JSONRPC):
                 if derivation == "m":
                     return "[{}]{}\n".format(master_fpr, xpub)
                 return "[{}/{}]{}\n".format(master_fpr, derivation.split("m/")[1], xpub)
+            except SpecterDIYNetworkMismatchError:
+                # a specific, actionable message ("switch the device to
+                # X") - let it propagate as the RPC error instead of the
+                # generic warning below, so the UI can show it to the user
+                raise
             except Exception as e:
                 logger.warning(
                     f"Failed to import Nested Segwit singlesig mainnet key. Error: {e}"

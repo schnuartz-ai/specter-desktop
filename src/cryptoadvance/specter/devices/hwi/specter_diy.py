@@ -23,6 +23,44 @@ from binascii import a2b_base64, b2a_base64
 py_enumerate = enumerate
 logger = logging.getLogger(__name__)
 
+# Prefix of the machine-parseable error the firmware sends back (as
+# "error: <this><network>") when it refuses a plain `xpub <path>` request
+# because the path's implied coin type doesn't match the network currently
+# active on the device. Keep in sync with specter-diy's
+# apps/xpubs/xpubs.py.
+_NETWORK_MISMATCH_PREFIX = "network mismatch: device is on "
+
+# Human-readable labels for the network identifiers the firmware reports,
+# matching the names shown on the device's own screen (embit's
+# NETWORKS[...]["name"]).
+_NETWORK_DISPLAY_NAMES = {
+    "main": "Mainnet",
+    "test": "Testnet",
+    "regtest": "Regtest",
+    "signet": "Signet",
+    "liquidv1": "Liquid",
+    "liquidtestnet": "Liquid Testnet",
+    "elementsregtest": "Liquid Regtest",
+}
+
+
+class SpecterDIYNetworkMismatchError(BadArgumentError):
+    """
+    The device refused an xpub request because the requested derivation's
+    coin type doesn't match the network currently active on the device
+    (e.g. asking for a mainnet-style key while the device is set to
+    Testnet). Raised instead of a generic BadArgumentError so callers can
+    tell the user exactly which network to switch the device to, the same
+    thing the device's own screen already told the person holding it.
+
+    :ivar device_network: the raw network identifier the device reported
+        (e.g. "test", "regtest") - not a display name.
+    """
+
+    def __init__(self, device_network: str, message: str) -> None:
+        super().__init__(message)
+        self.device_network = device_network
+
 
 class SpecterClient(HardwareWalletClient):
     """Create a client for a HID device that has already been opened.
@@ -92,7 +130,10 @@ class SpecterClient(HardwareWalletClient):
         """
         # xpub now requires on-device user confirmation and may take
         # arbitrarily long - wait indefinitely, same as sign_tx()
-        xpub = self.query("xpub %s" % bip32_path)
+        try:
+            xpub = self.query("xpub %s" % bip32_path)
+        except BadArgumentError as e:
+            raise self._network_mismatch_error(e) from e
         hd = ExtendedKey.deserialize(xpub)
         # Specter returns xpub with a prefix
         # for a network currently selected on the device
@@ -100,6 +141,36 @@ class SpecterClient(HardwareWalletClient):
             b"\x04\x88\xb2\x1e" if self.chain == Chain.MAIN else b"\x04\x35\x87\xcf"
         )
         return hd
+
+    def _network_mismatch_error(self, error: BadArgumentError) -> Exception:
+        """
+        Recognize the firmware's "network mismatch: device is on <network>"
+        response and turn it into a SpecterDIYNetworkMismatchError with a
+        message naming both networks involved. Any other BadArgumentError
+        is returned unchanged.
+        """
+        msg = str(error)
+        if not msg.startswith(_NETWORK_MISMATCH_PREFIX):
+            return error
+        device_network = msg[len(_NETWORK_MISMATCH_PREFIX) :].strip()
+        device_label = _NETWORK_DISPLAY_NAMES.get(
+            device_network, device_network.capitalize()
+        )
+        # We only know which *side* (main vs. everything test-like) of the
+        # network split we asked for - same ambiguity the device itself
+        # has, since testnet/signet/regtest/liquidtestnet all share BIP44
+        # coin type 1'. Naming the specific requested network would be a
+        # guess; naming the device's actual network (verbatim from the
+        # device) is not.
+        requested_label = (
+            "Mainnet" if self.chain == Chain.MAIN else "Testnet/Signet/Regtest"
+        )
+        return SpecterDIYNetworkMismatchError(
+            device_network,
+            "This Specter-DIY is currently set to %s, so it can't share a "
+            "%s key from here. Switch the device to %s and try again."
+            % (device_label, requested_label, requested_label),
+        )
 
     def begin_xpub_authorization(self, paths) -> bool:
         """

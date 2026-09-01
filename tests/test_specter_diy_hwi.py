@@ -19,9 +19,12 @@ from unittest.mock import MagicMock
 
 import pytest
 from hwilib.common import Chain
-from hwilib.errors import ActionCanceledError
+from hwilib.errors import ActionCanceledError, BadArgumentError
 
-from cryptoadvance.specter.devices.hwi.specter_diy import SpecterClient
+from cryptoadvance.specter.devices.hwi.specter_diy import (
+    SpecterClient,
+    SpecterDIYNetworkMismatchError,
+)
 
 
 def _client_with_mocked_transport():
@@ -106,3 +109,47 @@ def test_begin_xpub_authorization_noop_for_empty_paths():
     client = _client_with_mocked_transport()
     assert client.begin_xpub_authorization([]) is False
     client.dev.query.assert_not_called()
+
+
+def test_get_pubkey_at_path_translates_network_mismatch_on_mainnet_client():
+    client = _client_with_mocked_transport()
+    client.chain = Chain.MAIN
+    client.dev.query.return_value = "error: network mismatch: device is on test"
+
+    with pytest.raises(SpecterDIYNetworkMismatchError) as excinfo:
+        client.get_pubkey_at_path("m/84h/0h/0h")
+
+    err = excinfo.value
+    assert err.device_network == "test"
+    assert "Testnet" in str(err)
+    assert "Mainnet" in str(err)
+
+
+def test_get_pubkey_at_path_translates_network_mismatch_on_testnet_client():
+    client = _client_with_mocked_transport()
+    client.chain = Chain.TEST
+    client.dev.query.return_value = "error: network mismatch: device is on regtest"
+
+    with pytest.raises(SpecterDIYNetworkMismatchError) as excinfo:
+        client.get_pubkey_at_path("m/84h/1h/0h")
+
+    err = excinfo.value
+    assert err.device_network == "regtest"
+    assert "Regtest" in str(err)
+
+
+def test_get_pubkey_at_path_leaves_other_bad_argument_errors_alone():
+    client = _client_with_mocked_transport()
+    client.dev.query.return_value = "error: Invalid path"
+
+    with pytest.raises(BadArgumentError) as excinfo:
+        client.get_pubkey_at_path("m/84h/0h/0h")
+
+    assert not isinstance(excinfo.value, SpecterDIYNetworkMismatchError)
+    assert "Invalid path" in str(excinfo.value)
+
+
+def test_network_mismatch_error_is_a_bad_argument_error():
+    # callers that only know about the generic HWI exception hierarchy
+    # (e.g. existing except BadArgumentError blocks) still catch it
+    assert issubclass(SpecterDIYNetworkMismatchError, BadArgumentError)
