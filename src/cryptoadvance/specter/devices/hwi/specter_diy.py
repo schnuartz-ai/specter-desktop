@@ -163,7 +163,7 @@ class SpecterClient(HardwareWalletClient):
         # guess; naming the device's actual network (verbatim from the
         # device) is not.
         requested_label = (
-            "Mainnet" if self.chain == Chain.MAIN else "Testnet/Signet/Regtest"
+            "Mainnet" if self.chain == Chain.MAIN else "Testnet, Signet or Regtest"
         )
         return SpecterDIYNetworkMismatchError(
             device_network,
