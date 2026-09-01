@@ -43,6 +43,44 @@ _NETWORK_DISPLAY_NAMES = {
     "elementsregtest": "Liquid Regtest",
 }
 
+# Standard BIP44-style purposes that carry an implied coin type (and hence
+# an implied network). Keep in sync with specter-diy's apps/xpubs/scope.py.
+_STANDARD_PURPOSES = {44, 48, 49, 84, 86, 87}
+
+# By-name switch-to hint for a requested path's coin type, mirroring
+# specter-diy's network_hint_for_path(). Coin type 1' is shared by
+# testnet/signet/regtest/liquidtestnet/elementsregtest, so it can only be
+# named as the group.
+_COIN_TYPE_NETWORK_HINTS = {
+    0: "Mainnet",
+    1: "Testnet, Signet or Regtest",
+    1776: "Liquid",
+}
+
+
+def _requested_network_label(bip32_path):
+    """
+    The network a standard-purpose derivation path implies, by name, from
+    its coin type - or None if the path isn't standard-purpose (and so
+    carries no network meaning). Same logic the firmware applies.
+    """
+    parts = [p for p in str(bip32_path).strip().split("/") if p and p.lower() != "m"]
+    if len(parts) < 2:
+        return None
+
+    def _index(component):
+        component = component.strip().rstrip("h'")
+        return int(component)
+
+    try:
+        purpose = _index(parts[0])
+        coin_type = _index(parts[1])
+    except ValueError:
+        return None
+    if purpose not in _STANDARD_PURPOSES:
+        return None
+    return _COIN_TYPE_NETWORK_HINTS.get(coin_type)
+
 
 class SpecterDIYNetworkMismatchError(BadArgumentError):
     """
@@ -133,7 +171,7 @@ class SpecterClient(HardwareWalletClient):
         try:
             xpub = self.query("xpub %s" % bip32_path)
         except BadArgumentError as e:
-            raise self._network_mismatch_error(e) from e
+            raise self._network_mismatch_error(e, bip32_path) from e
         hd = ExtendedKey.deserialize(xpub)
         # Specter returns xpub with a prefix
         # for a network currently selected on the device
@@ -142,7 +180,9 @@ class SpecterClient(HardwareWalletClient):
         )
         return hd
 
-    def _network_mismatch_error(self, error: BadArgumentError) -> Exception:
+    def _network_mismatch_error(
+        self, error: BadArgumentError, bip32_path: str
+    ) -> Exception:
         """
         Recognize the firmware's "network mismatch: device is on <network>"
         response and turn it into a SpecterDIYNetworkMismatchError with a
@@ -156,15 +196,16 @@ class SpecterClient(HardwareWalletClient):
         device_label = _NETWORK_DISPLAY_NAMES.get(
             device_network, device_network.capitalize()
         )
-        # We only know which *side* (main vs. everything test-like) of the
-        # network split we asked for - same ambiguity the device itself
-        # has, since testnet/signet/regtest/liquidtestnet all share BIP44
-        # coin type 1'. Naming the specific requested network would be a
-        # guess; naming the device's actual network (verbatim from the
-        # device) is not.
-        requested_label = (
-            "Mainnet" if self.chain == Chain.MAIN else "Testnet, Signet or Regtest"
-        )
+        # Prefer the network implied by the path we actually asked for
+        # (its coin type) - that's unambiguous for mainnet (0') and Liquid
+        # (1776'), and for the shared 1' coin type it's the same group the
+        # device names on its own screen. Fall back to the client's chain
+        # only if the path isn't standard-purpose.
+        requested_label = _requested_network_label(bip32_path)
+        if requested_label is None:
+            requested_label = (
+                "Mainnet" if self.chain == Chain.MAIN else "Testnet, Signet or Regtest"
+            )
         return SpecterDIYNetworkMismatchError(
             device_network,
             "This Specter-DIY is currently set to %s, so it can't share a "

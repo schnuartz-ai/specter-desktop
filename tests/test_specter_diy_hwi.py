@@ -121,7 +121,9 @@ def test_get_pubkey_at_path_translates_network_mismatch_on_mainnet_client():
 
     err = excinfo.value
     assert err.device_network == "test"
+    # device's actual network, verbatim
     assert "Testnet" in str(err)
+    # the network the requested path implies (coin type 0')
     assert "Mainnet" in str(err)
 
 
@@ -136,6 +138,34 @@ def test_get_pubkey_at_path_translates_network_mismatch_on_testnet_client():
     err = excinfo.value
     assert err.device_network == "regtest"
     assert "Regtest" in str(err)
+
+
+def test_get_pubkey_at_path_names_the_requested_network_from_the_path_not_the_chain():
+    # the "switch to X" side comes from the requested path's coin type,
+    # so it is right even when the client's own chain wasn't set
+    client = _client_with_mocked_transport()
+    client.dev.query.return_value = "error: network mismatch: device is on main"
+
+    with pytest.raises(SpecterDIYNetworkMismatchError) as excinfo:
+        client.get_pubkey_at_path("m/84h/1h/0h")
+
+    msg = str(excinfo.value)
+    assert "currently set to Mainnet" in msg
+    assert "Testnet, Signet or Regtest" in msg
+
+
+def test_get_pubkey_at_path_names_liquid_on_a_liquid_coin_type_path():
+    # coin type 1776' is Liquid - unambiguous, and not expressible via the
+    # bitcoin-only Chain enum, so it has to come from the path
+    client = _client_with_mocked_transport()
+    client.dev.query.return_value = "error: network mismatch: device is on main"
+
+    with pytest.raises(SpecterDIYNetworkMismatchError) as excinfo:
+        client.get_pubkey_at_path("m/84h/1776h/0h")
+
+    msg = str(excinfo.value)
+    assert "currently set to Mainnet" in msg
+    assert "Liquid" in msg
 
 
 def test_get_pubkey_at_path_leaves_other_bad_argument_errors_alone():
