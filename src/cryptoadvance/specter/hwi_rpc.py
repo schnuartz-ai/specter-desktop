@@ -8,6 +8,7 @@ from embit import bip32
 from embit.liquid import networks
 from flask import current_app as app
 from hwilib.common import Chain
+from hwilib.errors import ActionCanceledError
 from hwilib.devices.bitbox02 import Bitbox02Client
 from hwilib.devices.bitbox02_lib.util import BitBoxAppNoiseConfig
 from hwilib.devices.trezorlib.transport import get_transport
@@ -16,7 +17,7 @@ from usb1 import USBError
 
 from .devices import __all__ as device_classes
 from .devices.hwi.jade import JadeClient
-from .devices.hwi.specter_diy import SpecterClient, SpecterDIYNetworkMismatchError
+from .devices.hwi.specter_diy import SpecterClient
 from .helpers import (
     deep_update,
     hwi_get_config,
@@ -269,16 +270,18 @@ class HWIBridge(JSONRPC):
                 if derivation == "m":
                     return "[{}]{}\n".format(master_fpr, xpub)
                 return "[{}/{}]{}\n".format(master_fpr, derivation.split("m/")[1], xpub)
-            except SpecterDIYNetworkMismatchError:
-                # a specific, actionable message ("switch the device to
-                # X") - let it propagate as the RPC error instead of the
-                # generic warning below, so the UI can show it to the user
+            except ActionCanceledError:
+                # the user declined the export on the device - a None
+                # return is the caller's "cancelled, stop quietly" signal
+                logger.info("xpub export at %s cancelled on the device", derivation)
+                return None
+            except Exception:
+                # the network-mismatch error and every real failure carry
+                # something the user needs to see - propagate it so the
+                # JSON-RPC error reaches the UI (handleHWIError() escapes
+                # it before rendering) instead of vanishing into a log and
+                # leaving the caller with an ambiguous None
                 raise
-            except Exception as e:
-                logger.warning(
-                    f"Failed to import Nested Segwit singlesig mainnet key. Error: {e}"
-                )
-                logger.exception(e)
 
     @locked(hwilock)
     def begin_xpub_authorization(

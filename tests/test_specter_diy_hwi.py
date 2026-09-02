@@ -183,3 +183,52 @@ def test_network_mismatch_error_is_a_bad_argument_error():
     # callers that only know about the generic HWI exception hierarchy
     # (e.g. existing except BadArgumentError blocks) still catch it
     assert issubclass(SpecterDIYNetworkMismatchError, BadArgumentError)
+
+
+def test_network_mismatch_message_never_echoes_the_device_string():
+    # the device controls the "<network>" token and the message is
+    # rendered (not escaped) in the UI - an unrecognized value must be
+    # replaced with a fixed phrase, not reflected
+    client = _client_with_mocked_transport()
+    payload = "<img src=x onerror=alert(1)>"
+    client.dev.query.return_value = "error: network mismatch: device is on " + payload
+
+    with pytest.raises(SpecterDIYNetworkMismatchError) as excinfo:
+        client.get_pubkey_at_path("m/84h/0h/0h")
+
+    err = excinfo.value
+    assert err.device_network == payload  # raw value kept for callers
+    assert payload not in str(err)
+    assert "<" not in str(err) and ">" not in str(err)
+    assert "an unknown network" in str(err)
+
+
+def test_network_mismatch_does_not_guess_a_target_for_an_unnamed_coin_type():
+    # standard purpose, but coin type 2' has no known network name - the
+    # firmware's own screen just says "the matching network" here, so the
+    # desktop message must not invent one from client.chain either
+    client = _client_with_mocked_transport()
+    client.chain = Chain.MAIN
+    client.dev.query.return_value = "error: network mismatch: device is on main"
+
+    with pytest.raises(SpecterDIYNetworkMismatchError) as excinfo:
+        client.get_pubkey_at_path("m/84h/2h/0h")
+
+    msg = str(excinfo.value)
+    assert "which doesn't match the requested derivation" in msg
+    assert "share a Mainnet key" not in msg  # no contradictory suggestion
+
+
+def test_network_mismatch_ignores_a_non_hardened_path_for_the_hint():
+    # firmware reads network semantics only from a hardened purpose/coin
+    # type; a non-hardened path must not drive the "switch to X" hint
+    client = _client_with_mocked_transport()
+    client.chain = Chain.MAIN
+    client.dev.query.return_value = "error: network mismatch: device is on test"
+
+    with pytest.raises(SpecterDIYNetworkMismatchError) as excinfo:
+        client.get_pubkey_at_path("m/84/1/0")  # no hardening markers
+
+    msg = str(excinfo.value)
+    assert "which doesn't match the requested derivation" in msg
+    assert "Testnet, Signet or Regtest" not in msg

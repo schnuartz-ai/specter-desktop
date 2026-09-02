@@ -58,13 +58,22 @@
         if(error.message !== undefined){
             error = error.message;
         }
-        if(typeof error === 'string' && error.indexOf('This Specter-DIY is currently set to') !== -1){
-            // Only this one message: it's a full user-actionable sentence
-            // ("...Switch the device to Mainnet and try again."), but the
-            // JSON-RPC layer wraps every -32000 error as "Internal error:
-            // <msg>." so it reads like a crash and gets a doubled period.
-            // Left untouched for every other device/error.
-            error = error.replace(/^Internal error:\s*/, '').replace(/\.\.$/, '.');
+        if(typeof error === 'string'){
+            if(error.indexOf('This Specter-DIY is currently set to') !== -1){
+                // our own whitelist-built sentence; the JSON-RPC layer
+                // wraps every -32000 error as "Internal error: <msg>." so
+                // it reads like a crash and gets a doubled period. Left
+                // untouched for every other device/error.
+                error = error.replace(/^Internal error:\s*/, '').replace(/\.\.$/, '.');
+            }
+            // An HWI error string can carry text straight from a connected
+            // device (the firmware echoes "error: <...>" through, and HWI
+            // does the same for other wallets). showError() renders via
+            // innerHTML, so escape it here - this is the one place
+            // untrusted device text enters the notification system.
+            error = error.replace(/[&<>"']/g, function(c){
+                return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
+            });
         }
         showError(error, 10000);
         if(overlayIsActive()){

@@ -62,19 +62,23 @@ def _requested_network_label(bip32_path):
     """
     The network a standard-purpose derivation path implies, by name, from
     its coin type - or None if the path isn't standard-purpose (and so
-    carries no network meaning). Same logic the firmware applies.
+    carries no network meaning). Matches the firmware rule: the purpose
+    and coin type must both be *hardened* for the path to carry network
+    semantics.
     """
     parts = [p for p in str(bip32_path).strip().split("/") if p and p.lower() != "m"]
     if len(parts) < 2:
         return None
 
-    def _index(component):
-        component = component.strip().rstrip("h'")
-        return int(component)
+    def _hardened_index(component):
+        component = component.strip()
+        if component[-1:] not in ("h", "H", "'"):
+            raise ValueError("not hardened")
+        return int(component[:-1])
 
     try:
-        purpose = _index(parts[0])
-        coin_type = _index(parts[1])
+        purpose = _hardened_index(parts[0])
+        coin_type = _hardened_index(parts[1])
     except ValueError:
         return None
     if purpose not in _STANDARD_PURPOSES:
@@ -193,25 +197,32 @@ class SpecterClient(HardwareWalletClient):
         if not msg.startswith(_NETWORK_MISMATCH_PREFIX):
             return error
         device_network = msg[len(_NETWORK_MISMATCH_PREFIX) :].strip()
-        device_label = _NETWORK_DISPLAY_NAMES.get(
-            device_network, device_network.capitalize()
+        # The device controls this string; never put it in the message
+        # verbatim (it's rendered, not escaped, in the UI). Only ever show
+        # a known, whitelisted label.
+        device_label = (
+            _NETWORK_DISPLAY_NAMES.get(device_network) or "an unknown network"
         )
-        # Prefer the network implied by the path we actually asked for
-        # (its coin type) - that's unambiguous for mainnet (0') and Liquid
-        # (1776'), and for the shared 1' coin type it's the same group the
-        # device names on its own screen. Fall back to the client's chain
-        # only if the path isn't standard-purpose.
+        # Name the network to switch to from the requested path's own coin
+        # type - unambiguous for mainnet (0') and Liquid (1776'), the
+        # shared group for 1'. If the coin type has no name we recognize,
+        # don't guess from the client's chain (that can produce a "switch
+        # to Mainnet" while the device already is on Mainnet) - say what
+        # the device's own screen says instead.
         requested_label = _requested_network_label(bip32_path)
-        if requested_label is None:
-            requested_label = (
-                "Mainnet" if self.chain == Chain.MAIN else "Testnet, Signet or Regtest"
+        if requested_label is not None:
+            message = (
+                "This Specter-DIY is currently set to %s, so it can't share a "
+                "%s key from here. Switch the device to %s and try again."
+                % (device_label, requested_label, requested_label)
             )
-        return SpecterDIYNetworkMismatchError(
-            device_network,
-            "This Specter-DIY is currently set to %s, so it can't share a "
-            "%s key from here. Switch the device to %s and try again."
-            % (device_label, requested_label, requested_label),
-        )
+        else:
+            message = (
+                "This Specter-DIY is currently set to %s, which doesn't match "
+                "the requested derivation. Switch the device to the network "
+                "that derivation is for and try again." % device_label
+            )
+        return SpecterDIYNetworkMismatchError(device_network, message)
 
     def begin_xpub_authorization(self, paths) -> bool:
         """
@@ -473,6 +484,11 @@ class SpecterUSBDevice(SpecterBase):
                 raw = self.ser.read(1)
                 res += raw
             except Exception as e:
+                raw = b""
+            if not raw:
+                # non-blocking read returned nothing (e.g. waiting for the
+                # user to confirm on the device) - yield the CPU instead
+                # of spinning on read(1)
                 time.sleep(0.01)
             if timeout is not None and time.time() > t0 + timeout:
                 self.ser.close()

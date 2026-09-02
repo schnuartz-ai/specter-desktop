@@ -200,6 +200,52 @@ def test_begin_xpub_authorization_normalises_paths_before_the_device_sees_them()
     assert client.calls[0] == ("begin", ["m/49h/0h/0h", "m/84h/0h/0h"])
 
 
+class _OneShotClient:
+    def __init__(self, exc):
+        self.chain = None
+        self._exc = exc
+
+    def get_master_fingerprint(self):
+        return bytes.fromhex("00000000")
+
+    def get_pubkey_at_path(self, path):
+        raise self._exc
+
+
+def _extract_one(exc):
+    bridge = HWIBridge(skip_hwi_initialisation=True)
+    with patch.object(
+        bridge, "_get_client", return_value=_fake_client_cm(_OneShotClient(exc))
+    ):
+        return bridge.jsonrpc(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "extract_xpub",
+                "params": {"derivation": "m/84h/0h/0h", "device_type": "specter"},
+            }
+        )
+
+
+def test_extract_xpub_returns_none_when_the_user_cancels():
+    resp = _extract_one(ActionCanceledError("nope"))
+    assert "error" not in resp
+    assert resp["result"] is None  # caller reads this as "cancelled, stop"
+
+
+def test_extract_xpub_propagates_other_failures_instead_of_swallowing_them():
+    from cryptoadvance.specter.devices.hwi.specter_diy import (
+        SpecterDIYNetworkMismatchError,
+    )
+
+    for exc in (
+        SpecterDIYNetworkMismatchError("test", "switch the device to Mainnet"),
+        RuntimeError("transport blew up"),
+    ):
+        resp = _extract_one(exc)
+        assert "error" in resp  # reaches the UI, not an ambiguous None
+
+
 @pytest.mark.skip()
 def test_trezor(caplog, monkeypatch):
     """In order to get this test working, you have to run it with "-s":
