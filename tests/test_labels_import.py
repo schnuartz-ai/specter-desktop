@@ -124,3 +124,50 @@ def test_bip329_import_export_and_frozen_state(funded_hot_wallet_1: Wallet):
     )
     assert thaw.updated_frozen_utxos == 1
     assert outpoint not in wallet.frozen_utxo
+
+
+def test_bip329_spendable_does_not_unlock_pending_psbt_input(
+    funded_hot_wallet_1: Wallet,
+):
+    wallet = funded_hot_wallet_1
+    wallet.check_utxo()
+    utxo = next(item for item in wallet.full_utxo if not item["locked"])
+    outpoint = f"{utxo['txid']}:{utxo['vout']}"
+    destination = "bcrt1q7mlxxdna2e2ufzgalgp5zhtnndl7qddlxjy5eg"
+    amount = round(float(utxo["amount"]) / 2, 8)
+    psbt = None
+
+    try:
+        psbt = wallet.createpsbt(
+            [destination],
+            [amount],
+            True,
+            0,
+            1,
+            selected_coins=[{"txid": utxo["txid"], "vout": utxo["vout"]}],
+        )
+        wallet.check_utxo()
+        assert outpoint in {
+            f"{item['txid']}:{item['vout']}" for item in wallet.rpc.listlockunspent()
+        }
+
+        freeze = wallet.import_address_labels(
+            json.dumps({"type": "output", "ref": outpoint, "spendable": False}),
+            return_report=True,
+        )
+        thaw = wallet.import_address_labels(
+            json.dumps({"type": "output", "ref": outpoint, "spendable": True}),
+            return_report=True,
+        )
+
+        assert freeze.updated_frozen_utxos == thaw.updated_frozen_utxos == 0
+        assert freeze.conflicting_records == thaw.conflicting_records == 1
+        assert outpoint not in wallet.frozen_utxo
+        assert outpoint in {
+            f"{item['txid']}:{item['vout']}" for item in wallet.rpc.listlockunspent()
+        }
+    finally:
+        if psbt is not None:
+            psbt_id = psbt.to_dict()["tx"]["txid"]
+            if psbt_id in wallet.pending_psbts:
+                wallet.delete_pending_psbt(psbt_id)

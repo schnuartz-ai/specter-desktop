@@ -857,9 +857,10 @@ def settings_importaddresslabels(wallet_alias):
         if report.has_warnings:
             flash(
                 _(
-                    "Some BIP-329 records were not imported (ignored: {}, malformed: {}, conflicting: {})."
+                    "Some BIP-329 metadata was not imported (ignored records: {}, unsupported output labels: {}, malformed records: {}, conflicting records: {})."
                 ).format(
                     report.ignored_records,
+                    report.unsupported_output_labels,
                     report.malformed_records,
                     report.conflicting_records,
                 ),

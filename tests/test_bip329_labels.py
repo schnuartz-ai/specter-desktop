@@ -34,6 +34,11 @@ class StubAddressList(dict):
 
 
 class StubWallet(Wallet):
+    def check_utxo(self):
+        self.check_utxo_calls += 1
+        if self.refreshed_utxos is not None:
+            self._full_utxo = list(self.refreshed_utxos)
+
     @property
     def recv_descriptor(self):
         return "recv-descriptor"
@@ -70,7 +75,10 @@ def make_wallet(addresses, utxos=None, frozen=None):
     )
     wallet._transactions = {}
     wallet._full_utxo = list(utxos or [])
+    wallet.refreshed_utxos = None
+    wallet.check_utxo_calls = 0
     wallet.frozen_utxo = list(frozen or [])
+    wallet.pending_psbts = {}
     wallet.name = "Savings Wallet"
     wallet.alias = "savings_wallet"
     wallet.description = ""
@@ -218,7 +226,7 @@ def test_import_addr_unknown_records_and_unknown_fields():
     assert report.ignored_records == 2
 
 
-def test_import_output_label_when_mapping_is_unambiguous():
+def test_output_labels_are_never_collapsed_into_address_labels():
     wallet = make_wallet(
         [make_address(ADDRESS_A, 0)],
         [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A}],
@@ -228,59 +236,31 @@ def test_import_output_label_when_mapping_is_unambiguous():
         json.dumps({"type": "output", "ref": f"{TXID_A}:0", "label": "Alice"})
     )
 
-    assert wallet._addresses[ADDRESS_A]["label"] == "Alice"
-    assert report.imported_address_labels == 1
-
-
-def test_import_output_labels_for_reused_address_requires_complete_agreement():
-    utxos = [
-        {"txid": TXID_A, "vout": 0, "address": ADDRESS_A},
-        {"txid": TXID_B, "vout": 1, "address": ADDRESS_A},
-    ]
-    wallet = make_wallet([make_address(ADDRESS_A, 0)], utxos)
-
-    incomplete = wallet.import_bip329_labels(
-        json.dumps({"type": "output", "ref": f"{TXID_A}:0", "label": "Alice"})
-    )
-
     assert wallet._addresses[ADDRESS_A]["label"] is None
-    assert incomplete.conflicting_records == 1
+    assert report.imported_address_labels == 0
+    assert report.unsupported_output_labels == 1
 
-    complete = wallet.import_bip329_labels(
+
+def test_spent_and_unspent_output_labels_on_reused_address_are_not_collapsed():
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_B, "vout": 1, "address": ADDRESS_A}],
+    )
+    report = wallet.import_bip329_labels(
         "\n".join(
             [
                 json.dumps({"type": "output", "ref": f"{TXID_A}:0", "label": "Alice"}),
-                json.dumps({"type": "output", "ref": f"{TXID_B}:1", "label": "Alice"}),
+                json.dumps({"type": "output", "ref": f"{TXID_B}:1", "label": "Bob"}),
             ]
         )
     )
 
-    assert wallet._addresses[ADDRESS_A]["label"] == "Alice"
-    assert complete.imported_address_labels == 1
-
-
-def test_conflicting_output_labels_are_not_collapsed():
-    wallet = make_wallet(
-        [make_address(ADDRESS_A, 0)],
-        [
-            {"txid": TXID_A, "vout": 0, "address": ADDRESS_A},
-            {"txid": TXID_B, "vout": 1, "address": ADDRESS_A},
-        ],
-    )
-    data = "\n".join(
-        [
-            json.dumps({"type": "output", "ref": f"{TXID_A}:0", "label": "Alice"}),
-            json.dumps({"type": "output", "ref": f"{TXID_B}:1", "label": "Bob"}),
-        ]
-    )
-
-    report = wallet.import_bip329_labels(data)
-
     assert wallet._addresses[ADDRESS_A]["label"] is None
-    assert report.conflicting_records == 2
+    assert report.ignored_records == 1
+    assert report.unsupported_output_labels == 1
 
 
-def test_addr_record_wins_without_silently_collapsing_conflicting_output_label():
+def test_addr_label_import_is_independent_of_unsupported_output_label():
     wallet = make_wallet(
         [make_address(ADDRESS_A, 0)],
         [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A}],
@@ -296,7 +276,7 @@ def test_addr_record_wins_without_silently_collapsing_conflicting_output_label()
 
     assert wallet._addresses[ADDRESS_A]["label"] == "Alice"
     assert report.imported_address_labels == 1
-    assert report.conflicting_records == 1
+    assert report.unsupported_output_labels == 1
 
 
 def test_matching_addr_and_output_records_are_idempotent():
@@ -316,6 +296,23 @@ def test_matching_addr_and_output_records_are_idempotent():
 
     assert wallet._addresses[ADDRESS_A]["label"] == "Alice"
     assert first.conflicting_records == second.conflicting_records == 0
+    assert first.unsupported_output_labels == second.unsupported_output_labels == 1
+
+
+def test_conflict_reporting_counts_all_affected_records():
+    wallet = make_wallet([make_address(ADDRESS_A, 0)])
+    data = "\n".join(
+        [
+            json.dumps({"type": "addr", "ref": ADDRESS_A, "label": "Alice"}),
+            json.dumps({"type": "addr", "ref": ADDRESS_A, "label": "Bob"}),
+            json.dumps({"type": "addr", "ref": ADDRESS_A, "label": "Alice"}),
+        ]
+    )
+
+    report = wallet.import_bip329_labels(data)
+
+    assert wallet._addresses[ADDRESS_A]["label"] is None
+    assert report.conflicting_records == 3
 
 
 def test_import_spendable_false_and_true_uses_existing_frozen_state():
@@ -341,6 +338,71 @@ def test_import_spendable_false_and_true_uses_existing_frozen_state():
     assert wallet.frozen_utxo == []
 
 
+def test_bip329_spendable_does_not_touch_pending_psbt_input():
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": True}],
+    )
+    wallet.pending_psbts = {
+        "pending": SimpleNamespace(utxo_dict=lambda: [{"txid": TXID_A, "vout": 0}])
+    }
+
+    freeze = wallet.import_bip329_labels(
+        json.dumps({"type": "output", "ref": outpoint, "spendable": False})
+    )
+    thaw = wallet.import_bip329_labels(
+        json.dumps({"type": "output", "ref": outpoint, "spendable": True})
+    )
+
+    assert wallet.frozen_utxo == []
+    assert freeze.updated_frozen_utxos == thaw.updated_frozen_utxos == 0
+    assert freeze.conflicting_records == thaw.conflicting_records == 1
+
+
+@pytest.mark.parametrize("spendable", [False, True])
+def test_bip329_does_not_change_an_unknown_core_lock(spendable):
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": True}],
+    )
+
+    report = wallet.import_bip329_labels(
+        json.dumps({"type": "output", "ref": outpoint, "spendable": spendable})
+    )
+
+    assert wallet.frozen_utxo == []
+    assert report.updated_frozen_utxos == 0
+    assert report.conflicting_records == 1
+
+
+def test_import_and_export_refresh_stale_utxo_cache():
+    refreshed_utxo = {
+        "txid": TXID_A,
+        "vout": 0,
+        "address": ADDRESS_A,
+        "locked": False,
+    }
+    export_wallet = make_wallet([make_address(ADDRESS_A, 0, "Alice")])
+    export_wallet.refreshed_utxos = [refreshed_utxo]
+
+    exported = parse_export(export_wallet)
+
+    assert export_wallet.check_utxo_calls == 1
+    assert {"type": "output", "ref": f"{TXID_A}:0", "label": "Alice"} in exported
+
+    import_wallet = make_wallet([make_address(ADDRESS_A, 0)])
+    import_wallet.refreshed_utxos = [refreshed_utxo]
+    report = import_wallet.import_bip329_labels(
+        json.dumps({"type": "output", "ref": f"{TXID_A}:0", "spendable": False})
+    )
+
+    assert import_wallet.check_utxo_calls == 1
+    assert import_wallet.frozen_utxo == [f"{TXID_A}:0"]
+    assert report.updated_frozen_utxos == 1
+
+
 def test_unknown_and_conflicting_outpoint_state_do_not_create_wallet_state():
     known_outpoint = f"{TXID_A}:0"
     wallet = make_wallet(
@@ -363,7 +425,10 @@ def test_unknown_and_conflicting_outpoint_state_do_not_create_wallet_state():
 
 
 def test_malformed_lines_and_values_fail_safely_but_valid_lines_import():
-    wallet = make_wallet([make_address(ADDRESS_A, 0)])
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": False}],
+    )
     data = "\n".join(
         [
             "not json",
@@ -371,6 +436,14 @@ def test_malformed_lines_and_values_fail_safely_but_valid_lines_import():
             json.dumps({"type": "addr", "ref": ADDRESS_A, "label": "München ₿"}),
             json.dumps(
                 {"type": "output", "ref": "not-an-outpoint", "spendable": False}
+            ),
+            json.dumps(
+                {
+                    "type": "output",
+                    "ref": f"{TXID_A}:0",
+                    "label": ["bad"],
+                    "spendable": False,
+                }
             ),
         ]
     )
@@ -380,23 +453,43 @@ def test_malformed_lines_and_values_fail_safely_but_valid_lines_import():
     report = wallet.import_bip329_labels(records, parse_report)
 
     assert wallet._addresses[ADDRESS_A]["label"] == "München ₿"
-    assert report.malformed_records == 3
+    assert wallet.frozen_utxo == []
+    assert report.malformed_records == 4
 
 
 def test_bip329_size_limits(monkeypatch):
     monkeypatch.setattr(bip329, "MAX_BIP329_FILE_SIZE", 20)
     with pytest.raises(ValueError, match="too large"):
-        parse_bip329_jsonl("x" * 21)
+        parse_bip329_jsonl(
+            json.dumps({"type": "addr", "ref": ADDRESS_A, "label": "Alice"})
+        )
+
+    legacy_records, legacy_report = parse_bip329_jsonl(
+        json.dumps({ADDRESS_A: "x" * 100})
+    )
+    assert legacy_records is None
+    assert not legacy_report.is_bip329
 
     monkeypatch.setattr(bip329, "MAX_BIP329_FILE_SIZE", 1000)
     monkeypatch.setattr(bip329, "MAX_BIP329_LINE_SIZE", 120)
     records, report = parse_bip329_jsonl(
-        "x" * 121
+        json.dumps({"type": "addr", "ref": ADDRESS_A, "label": "x" * 121})
         + "\n"
         + json.dumps({"type": "addr", "ref": ADDRESS_A, "label": "Alice"})
     )
     assert len(records) == 1
     assert report.malformed_records == 1
+
+
+def test_bip329_size_limit_does_not_restrict_legacy_imports(monkeypatch):
+    monkeypatch.setattr(bip329, "MAX_BIP329_FILE_SIZE", 20)
+    wallet = make_wallet([make_address(ADDRESS_A, 0)])
+    label = "legacy-" + "x" * 100
+
+    imported = wallet.import_address_labels(json.dumps({ADDRESS_A: label}))
+
+    assert imported == 1
+    assert wallet._addresses[ADDRESS_A]["label"] == label
 
 
 @pytest.mark.parametrize("payload", ["[]", '{"address": ["not a label"]}', "not json"])

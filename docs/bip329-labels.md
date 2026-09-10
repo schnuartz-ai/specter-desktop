@@ -31,30 +31,29 @@ needed.
 Specter's existing label mechanism. Unknown addresses and outpoints are ignored.
 Unknown record types and optional fields are ignored for forward compatibility.
 
-Specter has no independent per-output label store, so output labels are imported
-only when the conversion is lossless within the current known UTXO set:
+Specter has no independent per-output label store and cannot prove that mapping
+an output label to an address is safe across spent outputs and address reuse.
+Consequently, `output.label` is not converted into a Specter address label. It
+is counted and reported as unsupported. Use an `addr` record when the label is
+intended to describe the address.
 
-- all output records for a reused address must have the same label;
-- every current UTXO on that address must be represented by an agreeing output
-  record;
-- a differing existing explicit address label is never overwritten by an output
-  label;
-- an `addr` record is authoritative for address state; a conflicting `output`
-  label is skipped and reported.
+Conflicting duplicate address or spendable records are skipped rather than
+resolved by file order. Output `spendable:false` freezes a known UTXO and
+`spendable:true` unfreezes it using Specter's existing frozen UTXO mechanism.
+Specter refreshes the UTXO set before applying or exporting output state.
 
-Matching `addr` and `output` records are idempotent. Conflicting duplicate
-records are skipped rather than resolved by file order. Output `spendable:false`
-freezes a known UTXO and `spendable:true` unfreezes it using Specter's existing
-frozen UTXO mechanism; label conflicts do not prevent an otherwise valid frozen
-state from being applied.
+An output used by a pending PSBT is never frozen or unfrozen by a BIP-329 import.
+Such a request is reported as conflicting so the pending transaction's Bitcoin
+Core lock cannot be adopted and later removed accidentally. Other Core-locked
+outputs not owned by Specter's frozen list are protected in the same way.
 
 The broader address/transaction presentation mismatch remains tracked in
 [issue #2018](https://github.com/cryptoadvance/specter-desktop/issues/2018) and
 is intentionally not redesigned by this adapter.
 
-Malformed lines are skipped without creating wallet state, and the UI reports
-counts of ignored, malformed, and conflicting records without logging label or
-outpoint contents.
+Malformed records are validated atomically and skipped without creating wallet
+state. The UI reports counts of ignored records, unsupported output labels,
+malformed records, and conflicts without logging label or outpoint contents.
 
 ## Compatibility references
 

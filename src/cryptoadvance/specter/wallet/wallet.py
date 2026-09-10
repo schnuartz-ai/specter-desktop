@@ -585,10 +585,10 @@ class Wallet(AbstractWallet):
         """Apply representable BIP-329 metadata to the existing wallet model.
 
         Address records map directly to Specter's address labels. Output labels
-        are only collapsed to an address label when every currently known UTXO
-        on that address agrees, and they never replace a different explicit
-        address label. Output ``spendable`` state maps to the existing frozen
-        UTXO list independently of label conflicts.
+        are reported but not collapsed into address labels because Specter
+        cannot represent their historical, per-output semantics losslessly.
+        Output ``spendable`` state maps to the existing frozen UTXO list, except
+        for inputs reserved by pending PSBTs or another Core lock.
         """
 
         if isinstance(records, str):
@@ -600,23 +600,23 @@ class Wallet(AbstractWallet):
                 raise SpecterError("The supplied data is not BIP-329 JSON Lines.")
         result = result or BIP329ImportResult()
 
+        if any(record.get("type") == "output" for record in records):
+            # Spendable state and outpoint ownership must never be decided from
+            # the lazy full_utxo cache.
+            self.check_utxo()
+
         known_utxos = {}
-        outpoints_by_address = {}
         for utxo in self.full_utxo:
             txid = utxo.get("txid")
             vout = utxo.get("vout")
-            address = utxo.get("address")
             if not isinstance(txid, str) or not isinstance(vout, int):
                 continue
             outpoint = normalize_outpoint(f"{txid}:{vout}")
-            if outpoint is None or not isinstance(address, str):
+            if outpoint is None:
                 continue
-            known_utxos[outpoint] = address
-            outpoints_by_address.setdefault(address, set()).add(outpoint)
+            known_utxos[outpoint] = utxo
 
         addr_labels = {}
-        addr_records = set()
-        output_labels = {}
         spendable_values = {}
 
         for record in records:
@@ -637,8 +637,10 @@ class Wallet(AbstractWallet):
                 if not isinstance(label, str):
                     result.malformed_records += 1
                     continue
-                addr_records.add(ref)
-                addr_labels.setdefault(ref, set()).add(label)
+                if "spendable" in record:
+                    result.malformed_records += 1
+                    continue
+                addr_labels.setdefault(ref, []).append(label)
                 continue
             if record_type != "output":
                 result.ignored_records += 1
@@ -648,78 +650,33 @@ class Wallet(AbstractWallet):
             if outpoint is None:
                 result.malformed_records += 1
                 continue
-            address = known_utxos.get(outpoint)
-            if address is None:
+            if outpoint not in known_utxos:
                 result.ignored_records += 1
                 continue
 
-            usable_field = False
-            if "label" in record:
-                label = record["label"]
-                if isinstance(label, str):
-                    if label.strip():
-                        output_labels.setdefault(address, {}).setdefault(
-                            outpoint, set()
-                        ).add(label)
-                        usable_field = True
-                elif label is not None:
-                    result.malformed_records += 1
-            if "spendable" in record:
-                spendable = record["spendable"]
-                if isinstance(spendable, bool):
-                    spendable_values.setdefault(outpoint, set()).add(spendable)
-                    usable_field = True
-                else:
-                    result.malformed_records += 1
-            if not usable_field:
+            label = record.get("label")
+            spendable = record.get("spendable")
+            if (label is not None and not isinstance(label, str)) or (
+                "spendable" in record and not isinstance(spendable, bool)
+            ):
+                # Treat a malformed record atomically: a valid spendable field
+                # must not be applied when another supported field is invalid.
+                result.malformed_records += 1
+                continue
+
+            if isinstance(label, str) and label.strip():
+                result.unsupported_output_labels += 1
+            if isinstance(spendable, bool):
+                spendable_values.setdefault(outpoint, []).append(spendable)
+            elif not (isinstance(label, str) and label.strip()):
                 result.ignored_records += 1
 
         planned_labels = {}
-        conflicted_addresses = set()
         for address, labels in addr_labels.items():
-            if len(labels) == 1:
-                planned_labels[address] = next(iter(labels))
+            if len(set(labels)) == 1:
+                planned_labels[address] = labels[0]
             else:
-                conflicted_addresses.add(address)
                 result.conflicting_records += len(labels)
-
-        for address, labels_by_outpoint in output_labels.items():
-            labels = set().union(*labels_by_outpoint.values())
-            if (
-                address in conflicted_addresses
-                or any(len(values) != 1 for values in labels_by_outpoint.values())
-                or len(labels) != 1
-            ):
-                result.conflicting_records += sum(
-                    len(values) for values in labels_by_outpoint.values()
-                )
-                continue
-
-            output_label = next(iter(labels))
-            if address in addr_records:
-                if planned_labels.get(address) != output_label:
-                    result.conflicting_records += len(labels_by_outpoint)
-                # A matching addr record is already sufficient and idempotent.
-                continue
-
-            address_obj = self._addresses.get(address)
-            if address_obj is None:
-                result.ignored_records += len(labels_by_outpoint)
-                continue
-            stored_label = address_obj.get("label")
-            if stored_label:
-                if stored_label != output_label:
-                    result.conflicting_records += len(labels_by_outpoint)
-                # An agreeing existing address label makes this a no-op, even
-                # when the import contains only a subset of reused outputs.
-                continue
-
-            # Applying an output label to an address affects all outputs on that
-            # address. Require complete agreement across the current UTXO set.
-            if set(labels_by_outpoint) != outpoints_by_address[address]:
-                result.conflicting_records += len(labels_by_outpoint)
-                continue
-            planned_labels[address] = output_label
 
         labels_to_apply = [
             {"address": address, "label": label}
@@ -734,12 +691,28 @@ class Wallet(AbstractWallet):
             for outpoint in (normalize_outpoint(ref) for ref in self.frozen_utxo)
             if outpoint is not None
         }
+        pending_psbt_outpoints = set()
+        for psbt in self.pending_psbts.values():
+            for utxo in psbt.utxo_dict():
+                outpoint = normalize_outpoint(f"{utxo.get('txid')}:{utxo.get('vout')}")
+                if outpoint is not None:
+                    pending_psbt_outpoints.add(outpoint)
+
         to_toggle = []
         for outpoint, values in sorted(spendable_values.items()):
-            if len(values) != 1:
+            if len(set(values)) != 1:
                 result.conflicting_records += len(values)
                 continue
-            should_freeze = not next(iter(values))
+            if outpoint in pending_psbt_outpoints:
+                # Never adopt or remove a Core lock owned by a pending PSBT.
+                result.conflicting_records += len(values)
+                continue
+            should_freeze = not values[0]
+            utxo_is_locked = bool(known_utxos[outpoint].get("locked"))
+            if utxo_is_locked and outpoint not in frozen:
+                # Preserve non-Specter Core locks whose ownership is unknown.
+                result.conflicting_records += len(values)
+                continue
             if should_freeze != (outpoint in frozen):
                 to_toggle.append(outpoint)
         if to_toggle:
@@ -748,10 +721,12 @@ class Wallet(AbstractWallet):
 
         logger.info(
             "Applied BIP-329 import: %d address labels, %d frozen-state updates, "
-            "%d ignored, %d malformed, %d conflicting records",
+            "%d ignored, %d unsupported output labels, %d malformed, "
+            "%d conflicting records",
             result.imported_address_labels,
             result.updated_frozen_utxos,
             result.ignored_records,
+            result.unsupported_output_labels,
             result.malformed_records,
             result.conflicting_records,
         )
@@ -1369,6 +1344,10 @@ class Wallet(AbstractWallet):
         Output labels are derived from raw stored address labels. Display-only
         fallbacks such as ``Address #4`` and ``Change #8`` are never exported.
         """
+
+        # full_utxo is a lazy cache. Refresh it so the interoperability export
+        # reflects the wallet's current outputs and Core lock state.
+        self.check_utxo()
 
         records = []
         for address, address_obj in sorted(self._addresses.items()):

@@ -23,6 +23,7 @@ class BIP329ImportResult:
     imported_address_labels: int = 0
     updated_frozen_utxos: int = 0
     ignored_records: int = 0
+    unsupported_output_labels: int = 0
     malformed_records: int = 0
     conflicting_records: int = 0
     is_bip329: bool = True
@@ -30,7 +31,10 @@ class BIP329ImportResult:
     @property
     def has_warnings(self) -> bool:
         return bool(
-            self.ignored_records or self.malformed_records or self.conflicting_records
+            self.ignored_records
+            or self.unsupported_output_labels
+            or self.malformed_records
+            or self.conflicting_records
         )
 
 
@@ -62,16 +66,12 @@ def parse_bip329_jsonl(
     result = BIP329ImportResult()
     if not isinstance(value, str):
         return None, result
-    if len(value.encode("utf-8")) > MAX_BIP329_FILE_SIZE:
-        raise ValueError("BIP-329 label file is too large")
+    encoded_size = len(value.encode("utf-8"))
 
     records = []
     detected = False
     for line in value.splitlines():
         if not line.strip():
-            continue
-        if len(line.encode("utf-8")) > MAX_BIP329_LINE_SIZE:
-            result.malformed_records += 1
             continue
         try:
             record = json.loads(line)
@@ -82,6 +82,13 @@ def parse_bip329_jsonl(
         # Literal type/ref keys distinguish BIP-329 from Electrum's mapping.
         if isinstance(record, dict) and ("type" in record or "ref" in record):
             detected = True
+            # Apply the BIP-329 safety limit only after detecting BIP-329.
+            # Legacy Specter, Electrum and CSV imports had no such limit.
+            if encoded_size > MAX_BIP329_FILE_SIZE:
+                raise ValueError("BIP-329 label file is too large")
+            if len(line.encode("utf-8")) > MAX_BIP329_LINE_SIZE:
+                result.malformed_records += 1
+                continue
         if not isinstance(record, dict):
             result.malformed_records += 1
             continue
