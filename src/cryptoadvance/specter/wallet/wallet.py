@@ -47,6 +47,11 @@ from .bip329 import (
 logger = logging.getLogger(__name__)
 LISTTRANSACTIONS_BATCH_SIZE = 1000
 
+
+class FrozenStateConflictError(SpecterError):
+    """The requested frozen state would interfere with another lock owner."""
+
+
 purposes = OrderedDict(
     {
         None: "General",
@@ -686,49 +691,30 @@ class Wallet(AbstractWallet):
             self._addresses.set_labels(labels_to_apply)
         result.imported_address_labels = len(labels_to_apply)
 
-        frozen = {
-            outpoint
-            for outpoint in (normalize_outpoint(ref) for ref in self.frozen_utxo)
-            if outpoint is not None
-        }
-        pending_psbt_outpoints = set()
-        for psbt in self.pending_psbts.values():
-            for utxo in psbt.utxo_dict():
-                outpoint = normalize_outpoint(f"{utxo.get('txid')}:{utxo.get('vout')}")
-                if outpoint is not None:
-                    pending_psbt_outpoints.add(outpoint)
-
-        to_toggle = []
         for outpoint, values in sorted(spendable_values.items()):
             if len(set(values)) != 1:
                 result.conflicting_records += len(values)
                 continue
-            if outpoint in pending_psbt_outpoints:
-                # Never adopt or remove a Core lock owned by a pending PSBT.
+            try:
+                updated = self.set_frozen_state(outpoint, not values[0])
+            except FrozenStateConflictError:
                 result.conflicting_records += len(values)
-                continue
-            should_freeze = not values[0]
-            utxo_is_locked = bool(known_utxos[outpoint].get("locked"))
-            if utxo_is_locked and outpoint not in frozen:
-                # Preserve non-Specter Core locks whose ownership is unknown.
-                result.conflicting_records += len(values)
-                continue
-            if should_freeze != (outpoint in frozen):
-                to_toggle.append(outpoint)
-        if to_toggle:
-            self.toggle_freeze_utxo(to_toggle)
-        result.updated_frozen_utxos = len(to_toggle)
+            except SpecterError:
+                result.failed_records += len(values)
+            else:
+                result.updated_frozen_utxos += int(updated)
 
         logger.info(
             "Applied BIP-329 import: %d address labels, %d frozen-state updates, "
             "%d ignored, %d unsupported output labels, %d malformed, "
-            "%d conflicting records",
+            "%d conflicting, %d failed records",
             result.imported_address_labels,
             result.updated_frozen_utxos,
             result.ignored_records,
             result.unsupported_output_labels,
             result.malformed_records,
             result.conflicting_records,
+            result.failed_records,
         )
         return result
 
@@ -1162,6 +1148,95 @@ class Wallet(AbstractWallet):
             del self.pending_psbts[txid]
             if save:
                 self.save_to_file()
+
+    def set_frozen_state(self, outpoint, frozen):
+        """Set one UTXO's frozen state without adopting another lock owner.
+
+        Bitcoin Core's in-memory lock and Specter's persisted ``frozen_utxo``
+        entry are reconciled idempotently. Specter's local state is changed
+        only after any required ``lockunspent`` operation succeeds.
+
+        Returns ``True`` when either state needed updating and ``False`` when
+        both were already aligned. Raises ``FrozenStateConflictError`` for a
+        pending-PSBT or foreign Core lock, and ``SpecterError`` for RPC errors.
+        """
+
+        outpoint = normalize_outpoint(outpoint)
+        if outpoint is None or not isinstance(frozen, bool):
+            raise SpecterError("Invalid frozen UTXO state request")
+
+        pending_psbt_outpoints = set()
+        try:
+            for psbt in self.pending_psbts.values():
+                for utxo in psbt.utxo_dict():
+                    pending_outpoint = normalize_outpoint(
+                        f"{utxo.get('txid')}:{utxo.get('vout')}"
+                    )
+                    if pending_outpoint is not None:
+                        pending_psbt_outpoints.add(pending_outpoint)
+        except Exception as e:
+            raise FrozenStateConflictError(
+                "Could not safely determine pending PSBT inputs"
+            ) from e
+
+        if outpoint in pending_psbt_outpoints:
+            raise FrozenStateConflictError(
+                "Cannot change frozen state for a pending PSBT input"
+            )
+
+        try:
+            core_locked = {
+                normalized
+                for normalized in (
+                    normalize_outpoint(f"{utxo.get('txid')}:{utxo.get('vout')}")
+                    for utxo in self.rpc.listlockunspent()
+                )
+                if normalized is not None
+            }
+        except Exception as e:
+            raise SpecterError(
+                "Failed to read frozen UTXO state from Bitcoin Core"
+            ) from e
+
+        local_entries = [
+            ref for ref in self.frozen_utxo if normalize_outpoint(ref) == outpoint
+        ]
+        locally_frozen = bool(local_entries)
+        locked_in_core = outpoint in core_locked
+        if locked_in_core and not locally_frozen:
+            raise FrozenStateConflictError(
+                "Cannot change a Bitcoin Core lock not owned by Specter"
+            )
+
+        core_changed = False
+        if frozen != locked_in_core:
+            txid, vout = outpoint.split(":")
+            try:
+                success = self.rpc.lockunspent(
+                    not frozen,
+                    [{"txid": txid, "vout": int(vout)}],
+                )
+            except Exception as e:
+                raise SpecterError(
+                    "Failed to update frozen UTXO state in Bitcoin Core"
+                ) from e
+            if success is not True:
+                raise SpecterError("Bitcoin Core did not update the frozen UTXO state")
+            core_changed = True
+
+        local_changed = frozen != locally_frozen
+        if local_changed:
+            if frozen:
+                self.frozen_utxo.append(outpoint)
+            else:
+                self.frozen_utxo = [
+                    ref
+                    for ref in self.frozen_utxo
+                    if normalize_outpoint(ref) != outpoint
+                ]
+            self.save_to_file()
+
+        return core_changed or local_changed
 
     def toggle_freeze_utxo(self, utxo_list):
         # utxo = ["txid:vout", "txid:vout"]

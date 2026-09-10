@@ -26,6 +26,7 @@ class BIP329ImportResult:
     unsupported_output_labels: int = 0
     malformed_records: int = 0
     conflicting_records: int = 0
+    failed_records: int = 0
     is_bip329: bool = True
 
     @property
@@ -35,6 +36,7 @@ class BIP329ImportResult:
             or self.unsupported_output_labels
             or self.malformed_records
             or self.conflicting_records
+            or self.failed_records
         )
 
 

@@ -131,7 +131,12 @@ def test_bip329_spendable_does_not_unlock_pending_psbt_input(
 ):
     wallet = funded_hot_wallet_1
     wallet.check_utxo()
-    utxo = next(item for item in wallet.full_utxo if not item["locked"])
+    utxo = next(
+        item
+        for item in wallet.full_utxo
+        if not item["locked"]
+        and f"{item['txid']}:{item['vout']}" not in wallet.frozen_utxo
+    )
     outpoint = f"{utxo['txid']}:{utxo['vout']}"
     destination = "bcrt1q7mlxxdna2e2ufzgalgp5zhtnndl7qddlxjy5eg"
     amount = round(float(utxo["amount"]) / 2, 8)
@@ -171,3 +176,44 @@ def test_bip329_spendable_does_not_unlock_pending_psbt_input(
             psbt_id = psbt.to_dict()["tx"]["txid"]
             if psbt_id in wallet.pending_psbts:
                 wallet.delete_pending_psbt(psbt_id)
+
+
+def test_bip329_spendable_repairs_missing_core_lock(funded_hot_wallet_1: Wallet):
+    wallet = funded_hot_wallet_1
+    wallet.check_utxo()
+    utxo = next(
+        item
+        for item in wallet.full_utxo
+        if not item["locked"]
+        and f"{item['txid']}:{item['vout']}" not in wallet.frozen_utxo
+    )
+    outpoint = f"{utxo['txid']}:{utxo['vout']}"
+    core_utxo = {"txid": utxo["txid"], "vout": utxo["vout"]}
+
+    # Simulate a persisted Specter freeze after Bitcoin Core's in-memory lock
+    # was lost across a node restart.
+    wallet.frozen_utxo.append(outpoint)
+    wallet.save_to_file()
+    assert outpoint not in {
+        f"{item['txid']}:{item['vout']}" for item in wallet.rpc.listlockunspent()
+    }
+
+    try:
+        report = wallet.import_address_labels(
+            json.dumps({"type": "output", "ref": outpoint, "spendable": False}),
+            return_report=True,
+        )
+
+        assert report.updated_frozen_utxos == 1
+        assert report.failed_records == 0
+        assert outpoint in wallet.frozen_utxo
+        assert outpoint in {
+            f"{item['txid']}:{item['vout']}" for item in wallet.rpc.listlockunspent()
+        }
+    finally:
+        if outpoint in wallet.frozen_utxo:
+            wallet.set_frozen_state(outpoint, False)
+        elif outpoint in {
+            f"{item['txid']}:{item['vout']}" for item in wallet.rpc.listlockunspent()
+        }:
+            wallet.rpc.lockunspent(True, [core_utxo])

@@ -36,6 +36,10 @@ class StubAddressList(dict):
 
 
 class StubWallet(Wallet):
+    @property
+    def rpc(self):
+        return self._rpc
+
     def check_utxo(self):
         self.check_utxo_calls += 1
         if self.refreshed_utxos is not None:
@@ -81,6 +85,37 @@ def make_wallet(addresses, utxos=None, frozen=None):
     wallet.check_utxo_calls = 0
     wallet.frozen_utxo = list(frozen or [])
     wallet.pending_psbts = {}
+    wallet.core_locked_outpoints = {
+        f"{utxo['txid']}:{utxo['vout']}" for utxo in (utxos or []) if utxo.get("locked")
+    }
+    wallet.lockunspent_error = None
+    wallet._rpc = MagicMock()
+
+    def listlockunspent():
+        return [
+            {"txid": outpoint.split(":")[0], "vout": int(outpoint.split(":")[1])}
+            for outpoint in sorted(wallet.core_locked_outpoints)
+        ]
+
+    def lockunspent(unlock, outputs):
+        if wallet.lockunspent_error is not None:
+            raise wallet.lockunspent_error
+        for output in outputs:
+            outpoint = f"{output['txid']}:{output['vout']}"
+            if unlock:
+                wallet.core_locked_outpoints.discard(outpoint)
+            else:
+                wallet.core_locked_outpoints.add(outpoint)
+        return True
+
+    wallet._rpc.listlockunspent.side_effect = listlockunspent
+    wallet._rpc.lockunspent.side_effect = lockunspent
+    wallet.save_calls = 0
+
+    def save_to_file(self):
+        self.save_calls += 1
+
+    wallet.save_to_file = MethodType(save_to_file, wallet)
     wallet.name = "Savings Wallet"
     wallet.alias = "savings_wallet"
     wallet.description = ""
@@ -94,14 +129,6 @@ def make_wallet(addresses, utxos=None, frozen=None):
     wallet.keys = []
     wallet.sigs_required = 1
 
-    def toggle_freeze_utxo(self, outpoints):
-        for outpoint in outpoints:
-            if outpoint in self.frozen_utxo:
-                self.frozen_utxo.remove(outpoint)
-            else:
-                self.frozen_utxo.append(outpoint)
-
-    wallet.toggle_freeze_utxo = MethodType(toggle_freeze_utxo, wallet)
     return wallet
 
 
@@ -371,6 +398,77 @@ def test_import_spendable_false_and_true_uses_existing_frozen_state():
     assert duplicate.updated_frozen_utxos == 0
     assert thaw.updated_frozen_utxos == 1
     assert wallet.frozen_utxo == []
+
+
+def test_spendable_false_repairs_missing_core_lock_for_frozen_utxo():
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": False}],
+        frozen=[outpoint],
+    )
+
+    report = wallet.import_bip329_labels(
+        json.dumps({"type": "output", "ref": outpoint, "spendable": False})
+    )
+
+    assert wallet.frozen_utxo == [outpoint]
+    assert wallet.core_locked_outpoints == {outpoint}
+    assert report.updated_frozen_utxos == 1
+    assert report.failed_records == 0
+
+
+@pytest.mark.parametrize(
+    "initially_frozen,initially_locked,spendable",
+    [(False, False, False), (True, True, True)],
+)
+def test_frozen_state_rpc_failure_does_not_mutate_or_report_success(
+    initially_frozen, initially_locked, spendable
+):
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [
+            {
+                "txid": TXID_A,
+                "vout": 0,
+                "address": ADDRESS_A,
+                "locked": initially_locked,
+            }
+        ],
+        frozen=[outpoint] if initially_frozen else [],
+    )
+    wallet.lockunspent_error = RuntimeError("simulated RPC failure")
+
+    report = wallet.import_bip329_labels(
+        json.dumps({"type": "output", "ref": outpoint, "spendable": spendable})
+    )
+
+    assert (outpoint in wallet.frozen_utxo) == initially_frozen
+    assert (outpoint in wallet.core_locked_outpoints) == initially_locked
+    assert report.updated_frozen_utxos == 0
+    assert report.failed_records == 1
+    assert wallet.save_calls == 0
+
+
+def test_frozen_state_false_rpc_result_does_not_mutate_or_report_success():
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": False}],
+    )
+    wallet._rpc.lockunspent.side_effect = None
+    wallet._rpc.lockunspent.return_value = False
+
+    report = wallet.import_bip329_labels(
+        json.dumps({"type": "output", "ref": outpoint, "spendable": False})
+    )
+
+    assert wallet.frozen_utxo == []
+    assert wallet.core_locked_outpoints == set()
+    assert report.updated_frozen_utxos == 0
+    assert report.failed_records == 1
+    assert wallet.save_calls == 0
 
 
 def test_bip329_spendable_does_not_touch_pending_psbt_input():

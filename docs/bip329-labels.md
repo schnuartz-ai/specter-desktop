@@ -42,6 +42,13 @@ resolved by file order. Output `spendable:false` freezes a known UTXO and
 `spendable:true` unfreezes it using Specter's existing frozen UTXO mechanism.
 Specter refreshes the UTXO set before applying or exporting output state.
 
+The BIP-329 importer uses an explicit idempotent frozen-state operation rather
+than Specter's UI-oriented toggle. It compares Bitcoin Core's current lock with
+Specter's persisted ownership marker, repairs a missing Core lock when an
+already-frozen output is imported as `spendable:false`, and changes the local
+marker only after a required Core RPC succeeds. RPC failures are reported and
+never counted as successful updates.
+
 An output used by a pending PSBT is never frozen or unfrozen by a BIP-329 import.
 Such a request is reported as conflicting so the pending transaction's Bitcoin
 Core lock cannot be adopted and later removed accidentally. Other Core-locked
@@ -53,7 +60,8 @@ is intentionally not redesigned by this adapter.
 
 Malformed records are validated atomically and skipped without creating wallet
 state. The UI reports counts of ignored records, unsupported output labels,
-malformed records, and conflicts without logging label or outpoint contents.
+malformed records, conflicts, and failed operations without logging label or
+outpoint contents.
 
 ## Compatibility references
 
