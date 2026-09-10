@@ -6,7 +6,7 @@ from functools import wraps
 import requests
 from flask import Blueprint
 from flask import current_app as app
-from flask import jsonify, redirect, render_template, request, url_for
+from flask import Response, jsonify, redirect, render_template, request, url_for
 from flask_babel import lazy_gettext as _
 from flask_login import login_required
 
@@ -846,7 +846,26 @@ def settings_importaddresslabels(wallet_alias):
     wallet: Wallet = app.specter.wallet_manager.get_by_alias(wallet_alias)
     action = request.form["action"]
     address_labels = request.form["address_labels_data"]
-    imported_addresses_len = wallet.import_address_labels(address_labels)
+    report = wallet.import_address_labels(address_labels, return_report=True)
+    imported_addresses_len = report.imported_address_labels
+    if report.is_bip329:
+        flash(
+            _(
+                "Successfully imported {} address labels and updated {} frozen UTXOs."
+            ).format(imported_addresses_len, report.updated_frozen_utxos)
+        )
+        if report.has_warnings:
+            flash(
+                _(
+                    "Some BIP-329 records were not imported (ignored: {}, malformed: {}, conflicting: {})."
+                ).format(
+                    report.ignored_records,
+                    report.malformed_records,
+                    report.conflicting_records,
+                ),
+                "warning",
+            )
+        return redirect(url_for("wallets_endpoint.settings"))
     if imported_addresses_len > 1:
         flash(f"Successfully imported {imported_addresses_len} address labels.")
     elif imported_addresses_len == 1:
@@ -854,6 +873,25 @@ def settings_importaddresslabels(wallet_alias):
     else:
         flash("No address labels were imported.")
     return redirect(url_for("wallets_endpoint.settings"))
+
+
+@wallets_endpoint.route(
+    "/wallet/<wallet_alias>/settings/exportbip329labels", methods=["GET"]
+)
+@login_required
+def settings_exportbip329labels(wallet_alias):
+    wallet: Wallet = app.specter.wallet_manager.get_by_alias(wallet_alias)
+    response = Response(
+        wallet.export_bip329_labels(),
+        content_type="application/x-ndjson; charset=utf-8",
+    )
+    response.headers.set(
+        "Content-Disposition",
+        "attachment",
+        filename=f"{wallet.alias}-labels.jsonl",
+    )
+    response.headers.set("Cache-Control", "no-store")
+    return response
 
 
 @wallets_endpoint.route(

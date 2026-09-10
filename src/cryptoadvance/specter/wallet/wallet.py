@@ -36,6 +36,13 @@ from .tx_fetcher import TxFetcher
 from .txlist import TxItem, TxList, WalletAwareTxItem
 from .abstract_wallet import AbstractWallet
 from .addresslist import AddressList, Address
+from .bip329 import (
+    BIP329_TYPES,
+    BIP329ImportResult,
+    normalize_outpoint,
+    parse_bip329_jsonl,
+    serialize_bip329_records,
+)
 
 logger = logging.getLogger(__name__)
 LISTTRANSACTIONS_BATCH_SIZE = 1000
@@ -451,32 +458,98 @@ class Wallet(AbstractWallet):
         """
         TxFetcher.fetch_transactions(self)
 
-    def import_address_labels(self, address_labels):
+    def import_address_labels(self, address_labels, return_report=False):
         """
         Imports address_labels given in the formats:
             - Specter JSON
             - Electrum JSON
             - Specter CSV
+            - BIP-329 JSON Lines
         Returns the number of imported address labels
         """
         if not address_labels:
             logger.warning(f"No argument was passed.")
             raise SpecterError("Looks like you didn't input any data. Try again!")
+
         try:
+            bip329_records, bip329_result = parse_bip329_jsonl(address_labels)
+        except ValueError as e:
+            raise SpecterError(str(e)) from e
+        if bip329_records is not None:
+            result = self.import_bip329_labels(bip329_records, bip329_result)
+            return result if return_report else result.imported_address_labels
+
+        try:
+            raw_dictionary = json.loads(address_labels)
+        except ValueError:  # If json.loads is not possible, try Specter CSV.
+            logger.debug("In the Specter CSV part.")
+            labeled_addresses = {}
+            try:
+                f = StringIO(
+                    address_labels
+                )  # Drag & drop / pasting of CSV results in one giant string
+                dialect = csv.Sniffer().sniff(
+                    address_labels
+                )  # Delimiter is not always the same
+                reader = csv.DictReader(f, delimiter=dialect.delimiter)
+                if reader.fieldnames is None:
+                    raise Error("CSV header is missing")
+                reader.fieldnames = [name.lower() for name in reader.fieldnames]
+                if not {"address", "label"}.issubset(reader.fieldnames):
+                    raise Error("CSV must contain Address and Label columns")
+                for row in reader:
+                    address = row.get("address")
+                    label = row.get("label")
+                    if not isinstance(address, str) or not isinstance(label, str):
+                        continue
+                    if not label.startswith(
+                        "Address #"
+                    ):  # Avoids importing addresses with standard "Address #X" description
+                        labeled_addresses[address] = label
+                logger.info(
+                    "Parsed %d address labels from Specter CSV",
+                    len(labeled_addresses),
+                )
+            except (Error, KeyError, TypeError, AttributeError) as e:
+                raise SpecterError(
+                    f"Labels import failed. Check the import info box for the expected formats. Error: {e}"
+                )
+        else:
+            if not isinstance(raw_dictionary, dict):
+                raise SpecterError("Labels import failed: expected a JSON object.")
             # Specter JSON
-            if "alias" in json.loads(
-                address_labels
-            ):  # Key that is only present in Specter JSON
+            if "alias" in raw_dictionary:  # Key that is only present in Specter JSON
                 logger.debug("In the Specter JSON part.")
-                raw_dictionary = json.loads(address_labels)
+                labels = raw_dictionary.get("labels")
+                if not isinstance(labels, dict):
+                    raise SpecterError(
+                        "Labels import failed: Specter JSON labels must be an object."
+                    )
                 labeled_addresses = {}
-                for label, address in raw_dictionary["labels"].items():
-                    labeled_addresses[address[0]] = label
-                logger.info(f"Specter JSON was converted to {labeled_addresses}.")
+                for label, addresses in labels.items():
+                    if (
+                        isinstance(label, str)
+                        and isinstance(addresses, list)
+                        and addresses
+                        and isinstance(addresses[0], str)
+                    ):
+                        # Preserve the legacy importer's first-address behavior.
+                        labeled_addresses[addresses[0]] = label
+                logger.info(
+                    "Parsed %d address labels from Specter JSON",
+                    len(labeled_addresses),
+                )
             # Electrum JSON
             else:
                 logger.debug("In the Electrum JSON part.")
-                labeled_addresses = json.loads(address_labels)
+                if not all(
+                    isinstance(ref, str) and isinstance(label, str)
+                    for ref, label in raw_dictionary.items()
+                ):
+                    raise SpecterError(
+                        "Labels import failed: Electrum labels must map strings to strings."
+                    )
+                labeled_addresses = raw_dictionary
                 # write tx_label to address_label in labels
                 for txitem in self._transactions.values():
                     if txitem["txid"] not in labeled_addresses:
@@ -492,30 +565,9 @@ class Wallet(AbstractWallet):
                         labeled_addresses[one_address] = labeled_addresses[
                             txitem["txid"]
                         ]
-                logger.info(f"Electrum JSON was converted to {labeled_addresses}.")
-        # Specter CSV
-        except ValueError:  # If json.loads is not possible it throws a ValueError
-            logger.debug("In the Specter CSV part.")
-            labeled_addresses = {}
-            logger.debug(address_labels)
-            try:
-                f = StringIO(
-                    address_labels
-                )  # Drag & drop / pasting of CSV results in one giant string
-                dialect = csv.Sniffer().sniff(
-                    address_labels
-                )  # Delimiter is not always the same
-                reader = csv.DictReader(f, delimiter=dialect.delimiter)
-                reader.fieldnames = [name.lower() for name in reader.fieldnames]
-                for row in reader:
-                    if not row["label"].startswith(
-                        "Address #"
-                    ):  # Avoids importing addresses with standard "Address #X" description
-                        labeled_addresses[row["address"]] = row["label"]
-                logger.info(f"Specter label CSV was converted to {labeled_addresses}.")
-            except (Error, KeyError) as e:
-                raise SpecterError(
-                    f"Labels import failed. Check the import info box for the expected formats. Error: {e}"
+                logger.info(
+                    "Parsed %d address labels from Electrum JSON",
+                    len(labeled_addresses),
                 )
         # Convert labeled_addresses to arr (for AddressList.set_labels)
         arr = [
@@ -523,9 +575,187 @@ class Wallet(AbstractWallet):
             for address, label in labeled_addresses.items()
             if address in self._addresses
         ]
-        logger.info(f"Array for set_labels is: {arr}")
+        logger.info("Applying %d address labels", len(arr))
         self._addresses.set_labels(arr)
+        if return_report:
+            return BIP329ImportResult(imported_address_labels=len(arr), is_bip329=False)
         return len(arr)
+
+    def import_bip329_labels(self, records, result=None):
+        """Apply representable BIP-329 metadata to the existing wallet model.
+
+        Address records map directly to Specter's address labels. Output labels
+        are only collapsed to an address label when every currently known UTXO
+        on that address agrees, and they never replace a different explicit
+        address label. Output ``spendable`` state maps to the existing frozen
+        UTXO list independently of label conflicts.
+        """
+
+        if isinstance(records, str):
+            try:
+                records, result = parse_bip329_jsonl(records)
+            except ValueError as e:
+                raise SpecterError(str(e)) from e
+            if records is None:
+                raise SpecterError("The supplied data is not BIP-329 JSON Lines.")
+        result = result or BIP329ImportResult()
+
+        known_utxos = {}
+        outpoints_by_address = {}
+        for utxo in self.full_utxo:
+            txid = utxo.get("txid")
+            vout = utxo.get("vout")
+            address = utxo.get("address")
+            if not isinstance(txid, str) or not isinstance(vout, int):
+                continue
+            outpoint = normalize_outpoint(f"{txid}:{vout}")
+            if outpoint is None or not isinstance(address, str):
+                continue
+            known_utxos[outpoint] = address
+            outpoints_by_address.setdefault(address, set()).add(outpoint)
+
+        addr_labels = {}
+        addr_records = set()
+        output_labels = {}
+        spendable_values = {}
+
+        for record in records:
+            record_type = record["type"]
+            ref = record["ref"]
+            if record_type not in BIP329_TYPES:
+                # BIP-329 explicitly requires unknown future types to be ignored.
+                result.ignored_records += 1
+                continue
+            if record_type == "addr":
+                if ref not in self._addresses:
+                    result.ignored_records += 1
+                    continue
+                label = record.get("label")
+                if label is None or (isinstance(label, str) and not label.strip()):
+                    result.ignored_records += 1
+                    continue
+                if not isinstance(label, str):
+                    result.malformed_records += 1
+                    continue
+                addr_records.add(ref)
+                addr_labels.setdefault(ref, set()).add(label)
+                continue
+            if record_type != "output":
+                result.ignored_records += 1
+                continue
+
+            outpoint = normalize_outpoint(ref)
+            if outpoint is None:
+                result.malformed_records += 1
+                continue
+            address = known_utxos.get(outpoint)
+            if address is None:
+                result.ignored_records += 1
+                continue
+
+            usable_field = False
+            if "label" in record:
+                label = record["label"]
+                if isinstance(label, str):
+                    if label.strip():
+                        output_labels.setdefault(address, {}).setdefault(
+                            outpoint, set()
+                        ).add(label)
+                        usable_field = True
+                elif label is not None:
+                    result.malformed_records += 1
+            if "spendable" in record:
+                spendable = record["spendable"]
+                if isinstance(spendable, bool):
+                    spendable_values.setdefault(outpoint, set()).add(spendable)
+                    usable_field = True
+                else:
+                    result.malformed_records += 1
+            if not usable_field:
+                result.ignored_records += 1
+
+        planned_labels = {}
+        conflicted_addresses = set()
+        for address, labels in addr_labels.items():
+            if len(labels) == 1:
+                planned_labels[address] = next(iter(labels))
+            else:
+                conflicted_addresses.add(address)
+                result.conflicting_records += len(labels)
+
+        for address, labels_by_outpoint in output_labels.items():
+            labels = set().union(*labels_by_outpoint.values())
+            if (
+                address in conflicted_addresses
+                or any(len(values) != 1 for values in labels_by_outpoint.values())
+                or len(labels) != 1
+            ):
+                result.conflicting_records += sum(
+                    len(values) for values in labels_by_outpoint.values()
+                )
+                continue
+
+            output_label = next(iter(labels))
+            if address in addr_records:
+                if planned_labels.get(address) != output_label:
+                    result.conflicting_records += len(labels_by_outpoint)
+                # A matching addr record is already sufficient and idempotent.
+                continue
+
+            address_obj = self._addresses.get(address)
+            if address_obj is None:
+                result.ignored_records += len(labels_by_outpoint)
+                continue
+            stored_label = address_obj.get("label")
+            if stored_label:
+                if stored_label != output_label:
+                    result.conflicting_records += len(labels_by_outpoint)
+                # An agreeing existing address label makes this a no-op, even
+                # when the import contains only a subset of reused outputs.
+                continue
+
+            # Applying an output label to an address affects all outputs on that
+            # address. Require complete agreement across the current UTXO set.
+            if set(labels_by_outpoint) != outpoints_by_address[address]:
+                result.conflicting_records += len(labels_by_outpoint)
+                continue
+            planned_labels[address] = output_label
+
+        labels_to_apply = [
+            {"address": address, "label": label}
+            for address, label in sorted(planned_labels.items())
+        ]
+        if labels_to_apply:
+            self._addresses.set_labels(labels_to_apply)
+        result.imported_address_labels = len(labels_to_apply)
+
+        frozen = {
+            outpoint
+            for outpoint in (normalize_outpoint(ref) for ref in self.frozen_utxo)
+            if outpoint is not None
+        }
+        to_toggle = []
+        for outpoint, values in sorted(spendable_values.items()):
+            if len(values) != 1:
+                result.conflicting_records += len(values)
+                continue
+            should_freeze = not next(iter(values))
+            if should_freeze != (outpoint in frozen):
+                to_toggle.append(outpoint)
+        if to_toggle:
+            self.toggle_freeze_utxo(to_toggle)
+        result.updated_frozen_utxos = len(to_toggle)
+
+        logger.info(
+            "Applied BIP-329 import: %d address labels, %d frozen-state updates, "
+            "%d ignored, %d malformed, %d conflicting records",
+            result.imported_address_labels,
+            result.updated_frozen_utxos,
+            result.ignored_records,
+            result.malformed_records,
+            result.conflicting_records,
+        )
+        return result
 
     def update(self):
         self.getdata()
@@ -973,7 +1203,7 @@ class Wallet(AbstractWallet):
                 except Exception as e:
                     # UTXO was spent ?!
                     logger.exception(e)
-                logger.info(f"Unfreeze {utxo}")
+                logger.info("Unfroze a wallet UTXO")
                 self.frozen_utxo.remove(utxo)
             else:
                 try:
@@ -981,10 +1211,10 @@ class Wallet(AbstractWallet):
                         False,
                         [{"txid": utxo.split(":")[0], "vout": int(utxo.split(":")[1])}],
                     )
-                except Exception as e:
+                except Exception:
                     # UTXO was spent
-                    logger.debug("Failed to lock UTXO %s: %s", utxo, e)
-                logger.info(f"Freeze {utxo}")
+                    logger.debug("Failed to lock a wallet UTXO")
+                logger.info("Froze a wallet UTXO")
                 self.frozen_utxo.append(utxo)
             utxo_list_done.append(utxo)
 
@@ -1132,6 +1362,48 @@ class Wallet(AbstractWallet):
 
     def export_labels(self):
         return self._addresses.get_labels()
+
+    def export_bip329_labels(self):
+        """Export address labels and current UTXO metadata as BIP-329 JSONL.
+
+        Output labels are derived from raw stored address labels. Display-only
+        fallbacks such as ``Address #4`` and ``Change #8`` are never exported.
+        """
+
+        records = []
+        for address, address_obj in sorted(self._addresses.items()):
+            label = address_obj.get("label")
+            if label:
+                records.append({"type": "addr", "ref": address, "label": label})
+
+        frozen = {
+            outpoint
+            for outpoint in (normalize_outpoint(ref) for ref in self.frozen_utxo)
+            if outpoint is not None
+        }
+        output_records = []
+        for utxo in self.full_utxo:
+            txid = utxo.get("txid")
+            vout = utxo.get("vout")
+            address = utxo.get("address")
+            if not isinstance(txid, str) or not isinstance(vout, int):
+                continue
+            outpoint = normalize_outpoint(f"{txid}:{vout}")
+            if outpoint is None:
+                continue
+            address_obj = self._addresses.get(address)
+            label = address_obj.get("label") if address_obj is not None else None
+            if not label and outpoint not in frozen:
+                continue
+            record = {"type": "output", "ref": outpoint}
+            if label:
+                record["label"] = label
+            if outpoint in frozen:
+                record["spendable"] = False
+            output_records.append(record)
+
+        records.extend(sorted(output_records, key=lambda item: item["ref"]))
+        return serialize_bip329_records(records)
 
     def import_labels(self, labels):
         # format:

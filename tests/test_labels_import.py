@@ -64,3 +64,63 @@ def test_import_address_labels(
     wallet._addresses[test_address].set_label("label_got_lost")
     wallet.import_address_labels(csv_string)
     assert wallet._addresses[test_address]["label"] == "some_fancy_label_csv"
+
+
+def test_bip329_import_export_and_frozen_state(funded_hot_wallet_1: Wallet):
+    wallet = funded_hot_wallet_1
+    wallet.check_utxo()
+    utxo = wallet.full_utxo[0]
+    address = utxo["address"]
+    outpoint = f"{utxo['txid']}:{utxo['vout']}"
+    label = 'München – Rücklage ₿ "quoted" \\ path\nnext'
+
+    if outpoint in wallet.frozen_utxo:
+        wallet.toggle_freeze_utxo([outpoint])
+        wallet.check_utxo()
+    wallet._addresses[address].set_label("")
+
+    data = "\n".join(
+        [
+            json.dumps(
+                {"type": "addr", "ref": address, "label": label},
+                ensure_ascii=False,
+            ),
+            json.dumps(
+                {
+                    "type": "output",
+                    "ref": outpoint,
+                    "label": label,
+                    "spendable": False,
+                },
+                ensure_ascii=False,
+            ),
+        ]
+    )
+
+    report = wallet.import_address_labels(data, return_report=True)
+    wallet.check_utxo()
+
+    assert report.is_bip329
+    assert report.imported_address_labels == 1
+    assert report.updated_frozen_utxos == 1
+    assert wallet._addresses[address]["label"] == label
+    assert outpoint in wallet.frozen_utxo
+
+    exported = [json.loads(line) for line in wallet.export_bip329_labels().splitlines()]
+    assert {"type": "addr", "ref": address, "label": label} in exported
+    assert {
+        "type": "output",
+        "ref": outpoint,
+        "label": label,
+        "spendable": False,
+    } in exported
+
+    duplicate = wallet.import_address_labels(data, return_report=True)
+    assert duplicate.updated_frozen_utxos == 0
+
+    thaw = wallet.import_address_labels(
+        json.dumps({"type": "output", "ref": outpoint, "spendable": True}),
+        return_report=True,
+    )
+    assert thaw.updated_frozen_utxos == 1
+    assert outpoint not in wallet.frozen_utxo
