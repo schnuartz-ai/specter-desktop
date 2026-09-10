@@ -849,11 +849,12 @@ def settings_importaddresslabels(wallet_alias):
     report = wallet.import_address_labels(address_labels, return_report=True)
     imported_addresses_len = report.imported_address_labels
     if report.is_bip329:
-        flash(
-            _(
-                "Successfully imported {} address labels and updated {} frozen UTXOs."
-            ).format(imported_addresses_len, report.updated_frozen_utxos)
-        )
+        if imported_addresses_len or report.updated_frozen_utxos:
+            flash(
+                _(
+                    "Successfully imported {} address labels and updated {} frozen UTXOs."
+                ).format(imported_addresses_len, report.updated_frozen_utxos)
+            )
         if report.has_warnings:
             flash(
                 _(
@@ -864,6 +865,11 @@ def settings_importaddresslabels(wallet_alias):
                     report.malformed_records,
                     report.conflicting_records,
                 ),
+                "warning",
+            )
+        elif not imported_addresses_len and not report.updated_frozen_utxos:
+            flash(
+                _("No wallet labels or frozen UTXO states needed updating."),
                 "warning",
             )
         return redirect(url_for("wallets_endpoint.settings"))

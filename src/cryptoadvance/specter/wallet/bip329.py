@@ -79,8 +79,14 @@ def parse_bip329_jsonl(
             result.malformed_records += 1
             continue
 
-        # Literal type/ref keys distinguish BIP-329 from Electrum's mapping.
-        if isinstance(record, dict) and ("type" in record or "ref" in record):
+        # Require one structurally valid, currently defined BIP-329 record
+        # before taking this document away from Specter's legacy importers.
+        if (
+            isinstance(record, dict)
+            and isinstance(record.get("type"), str)
+            and record["type"] in BIP329_TYPES
+            and isinstance(record.get("ref"), str)
+        ):
             detected = True
             # Apply the BIP-329 safety limit only after detecting BIP-329.
             # Legacy Specter, Electrum and CSV imports had no such limit.

@@ -6,7 +6,9 @@ from unittest.mock import MagicMock
 import pytest
 from flask import Flask
 
+from cryptoadvance.specter.server_endpoints.wallets import wallets as wallets_module
 from cryptoadvance.specter.server_endpoints.wallets.wallets import (
+    settings_importaddresslabels,
     settings_exportbip329labels,
 )
 from cryptoadvance.specter.specter_error import SpecterError
@@ -185,6 +187,39 @@ def test_bip329_download_is_separate_utf8_jsonl_attachment():
     assert response.headers["Cache-Control"] == "no-store"
     assert "savings_wallet-labels.jsonl" in response.headers["Content-Disposition"]
     assert "München ₿" in response.get_data(as_text=True)
+
+
+def test_warning_only_bip329_import_is_not_flashed_as_success(monkeypatch):
+    wallet = make_wallet([make_address(ADDRESS_A, 0)])
+    flashes = []
+    flask_app = Flask(__name__)
+    flask_app.secret_key = "test-only"
+    flask_app.specter = SimpleNamespace(
+        wallet_manager=SimpleNamespace(get_by_alias=lambda alias: wallet)
+    )
+    monkeypatch.setattr(wallets_module, "_", lambda message: message)
+    monkeypatch.setattr(
+        wallets_module,
+        "flash",
+        lambda message, category=None: flashes.append((category, message)),
+    )
+    monkeypatch.setattr(wallets_module, "url_for", lambda endpoint: "/settings")
+
+    with flask_app.test_request_context(
+        method="POST",
+        data={
+            "action": "import_address_labels",
+            "address_labels_data": json.dumps(
+                {"type": "addr", "ref": UNKNOWN_ADDRESS, "label": "Not ours"}
+            ),
+        },
+    ):
+        settings_importaddresslabels.__wrapped__(wallet.alias)
+
+    assert len(flashes) == 1
+    assert flashes[0][0] == "warning"
+    assert "not imported" in flashes[0][1]
+    assert not any(message.startswith("Successfully") for category, message in flashes)
 
 
 def test_unicode_and_json_escaping_round_trip():
@@ -490,6 +525,19 @@ def test_bip329_size_limit_does_not_restrict_legacy_imports(monkeypatch):
 
     assert imported == 1
     assert wallet._addresses[ADDRESS_A]["label"] == label
+
+
+def test_legacy_json_with_type_key_is_not_misdetected_as_bip329():
+    wallet = make_wallet([make_address(ADDRESS_A, 0)])
+
+    report = wallet.import_address_labels(
+        json.dumps({"type": "addr", ADDRESS_A: "Alice"}),
+        return_report=True,
+    )
+
+    assert not report.is_bip329
+    assert report.imported_address_labels == 1
+    assert wallet._addresses[ADDRESS_A]["label"] == "Alice"
 
 
 @pytest.mark.parametrize("payload", ["[]", '{"address": ["not a label"]}', "not json"])
