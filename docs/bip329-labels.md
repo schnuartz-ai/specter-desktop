@@ -97,8 +97,10 @@ state and independently attempts to restore Core's prior lock state.
 A wallet-specific reentrant lock serializes the complete pending-PSBT read,
 Core RPC, RAM update, and wallet-write sequence. Pending-PSBT save/delete and
 the legacy UI freeze toggle use the same lock, so their Core-lock ownership
-transitions cannot interleave. Deleting a pending PSBT does not unlock an input
-that remains protected by a Specter freeze or another pending PSBT.
+transitions cannot interleave. Every wallet JSON snapshot and write also takes
+this lock, so an older concurrent save cannot overwrite a newer ownership
+state. Deleting a pending PSBT does not unlock an input that remains protected
+by a Specter freeze or another pending PSBT.
 
 Outputs used by pending PSBTs are never frozen or unfrozen by this importer.
 A Core lock without a matching Specter frozen marker is protected in the same

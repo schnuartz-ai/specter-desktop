@@ -1085,7 +1085,11 @@ class Wallet(AbstractWallet):
 
     def _persist_wallet_file(self):
         """Write and verify wallet JSON without post-persistence side effects."""
-        write_json_file_without_callback(self.to_json(), self.fullpath)
+        # Build the snapshot while holding the same lock as pending-PSBT and
+        # frozen-UTXO mutations. Otherwise an older snapshot could be written
+        # after a newer UTXO-ownership state has already been persisted.
+        with self._utxo_state_lock:
+            write_json_file_without_callback(self.to_json(), self.fullpath)
 
     def save_to_file(self):
         self._persist_wallet_file()

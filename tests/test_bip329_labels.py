@@ -623,6 +623,81 @@ def test_pending_psbt_save_is_serialized_against_freeze():
     assert wallet.core_locked_outpoints == {outpoint}
 
 
+def test_general_wallet_save_cannot_overwrite_new_pending_psbt_snapshot(monkeypatch):
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": False}],
+    )
+    wallet._persist_wallet_file = MethodType(Wallet._persist_wallet_file, wallet)
+    wallet.to_json = MethodType(
+        lambda self, for_export=False: {"pending_psbts": sorted(self.pending_psbts)},
+        wallet,
+    )
+    psbt = SimpleNamespace(
+        txid="pending",
+        utxo_dict=lambda: [{"txid": TXID_A, "vout": 0}],
+    )
+    old_snapshot_reached_writer = threading.Event()
+    allow_old_snapshot_write = threading.Event()
+    pending_save_started = threading.Event()
+    pending_save_finished = threading.Event()
+    persisted_snapshots = []
+    errors = []
+
+    def write_snapshot(content, path):
+        if threading.current_thread().name == "general-wallet-save":
+            old_snapshot_reached_writer.set()
+            if not allow_old_snapshot_write.wait(timeout=5):
+                raise RuntimeError("test timed out waiting to write old snapshot")
+        persisted_snapshots.append(content)
+
+    def general_save():
+        try:
+            wallet.save_to_file()
+        except Exception as e:
+            errors.append(e)
+
+    def save_pending():
+        pending_save_started.set()
+        try:
+            wallet.save_pending_psbt(psbt)
+        except Exception as e:
+            errors.append(e)
+        finally:
+            pending_save_finished.set()
+
+    monkeypatch.setattr(
+        "cryptoadvance.specter.wallet.wallet.write_json_file_without_callback",
+        write_snapshot,
+    )
+    monkeypatch.setattr(
+        "cryptoadvance.specter.wallet.wallet.storage_callback", MagicMock()
+    )
+    general_thread = threading.Thread(target=general_save, name="general-wallet-save")
+    pending_thread = threading.Thread(target=save_pending, name="pending-save")
+
+    general_thread.start()
+    assert old_snapshot_reached_writer.wait(timeout=5)
+    pending_thread.start()
+    assert pending_save_started.wait(timeout=5)
+    assert not pending_save_finished.wait(timeout=0.2)
+    assert wallet.pending_psbts == {}
+    allow_old_snapshot_write.set()
+    general_thread.join(timeout=5)
+    pending_thread.join(timeout=5)
+
+    assert not general_thread.is_alive()
+    assert not pending_thread.is_alive()
+    assert errors == []
+    assert persisted_snapshots == [
+        {"pending_psbts": []},
+        {"pending_psbts": ["pending"]},
+    ]
+    assert set(wallet.pending_psbts) == {"pending"}
+    assert wallet.core_locked_outpoints == {outpoint}
+
+
 def test_pending_psbt_delete_is_serialized_against_unfreeze():
     outpoint = f"{TXID_A}:0"
     wallet = make_wallet(
