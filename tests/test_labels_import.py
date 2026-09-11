@@ -220,7 +220,7 @@ def test_bip329_spendable_repairs_missing_core_lock(funded_hot_wallet_1: Wallet)
             wallet.rpc.lockunspent(True, [core_utxo])
 
 
-def test_frozen_state_save_failure_rolls_back_core_and_memory(
+def test_frozen_state_post_write_failure_rolls_back_core_memory_and_file(
     funded_hot_wallet_1: Wallet, monkeypatch
 ):
     wallet = funded_hot_wallet_1
@@ -233,12 +233,14 @@ def test_frozen_state_save_failure_rolls_back_core_and_memory(
     )
     outpoint = f"{utxo['txid']}:{utxo['vout']}"
     core_utxo = {"txid": utxo["txid"], "vout": utxo["vout"]}
-    original_save = wallet.save_to_file
+    with open(wallet.fullpath, encoding="utf-8") as wallet_file:
+        original_wallet_json = json.load(wallet_file)
+    original_update_balance = wallet.update_balance
 
-    def fail_save():
-        raise SpecterError("simulated persistence failure")
+    def fail_update_balance():
+        raise SpecterError("simulated post-write balance failure")
 
-    monkeypatch.setattr(wallet, "save_to_file", fail_save)
+    monkeypatch.setattr(wallet, "update_balance", fail_update_balance)
     try:
         report = wallet.import_address_labels(
             json.dumps({"type": "output", "ref": outpoint, "spendable": False}),
@@ -251,8 +253,10 @@ def test_frozen_state_save_failure_rolls_back_core_and_memory(
         assert outpoint not in {
             f"{item['txid']}:{item['vout']}" for item in wallet.rpc.listlockunspent()
         }
+        with open(wallet.fullpath, encoding="utf-8") as wallet_file:
+            assert json.load(wallet_file) == original_wallet_json
     finally:
-        monkeypatch.setattr(wallet, "save_to_file", original_save)
+        monkeypatch.setattr(wallet, "update_balance", original_update_balance)
         if outpoint in {
             f"{item['txid']}:{item['vout']}" for item in wallet.rpc.listlockunspent()
         }:

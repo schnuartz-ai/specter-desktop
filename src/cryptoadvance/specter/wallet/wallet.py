@@ -1238,9 +1238,18 @@ class Wallet(AbstractWallet):
             try:
                 self.save_to_file()
             except Exception as e:
-                # Persistence restores the previous wallet file on failure.
-                # Restore RAM as well, then compensate any successful Core RPC.
+                # save_to_file() writes before refreshing the balance, so an
+                # exception does not imply that the wallet file is unchanged.
+                # Restore RAM and persist that snapshot without another balance
+                # refresh, then compensate any successful Core RPC independently.
                 self.frozen_utxo = original_frozen_utxo
+                try:
+                    write_json_file(self.to_json(), self.fullpath)
+                except Exception:
+                    logger.critical(
+                        "Failed to roll back persisted frozen UTXO state; "
+                        "manual wallet state verification is required"
+                    )
                 if core_changed:
                     try:
                         rollback_succeeded = self.rpc.lockunspent(

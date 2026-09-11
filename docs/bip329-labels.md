@@ -81,8 +81,9 @@ Frozen-state updates reconcile Specter's persisted ownership marker with
 Bitcoin Core's current lock state. The operation is idempotent, repairs a
 missing non-persistent Core lock for an existing Specter freeze, and does not
 record a successful update unless the required Core operation and persistence
-succeed. Failure handling restores the prior local state and attempts to
-restore Core's prior lock state.
+succeed. Failure handling restores the prior in-memory and persisted state
+without repeating the balance refresh, and independently attempts to restore
+Core's prior lock state.
 
 Outputs used by pending PSBTs are never frozen or unfrozen by this importer.
 Other Core locks not owned by Specter's frozen list are protected in the same
