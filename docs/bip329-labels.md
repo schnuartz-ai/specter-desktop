@@ -47,6 +47,15 @@ information and could change the apparent labels of other transactions. For
 that reason, Specter exports the derived `output.label` records but does not
 import arbitrary `output.label` records into its address-only store.
 
+This remains true even when, for example, ten current UTXOs on the same address
+all carry the identical `output.label` value. Agreement among the current UTXOs
+does not prove that spent historical outputs on a reused address had the same
+meaning. Specter therefore does not infer an address label from those ten
+records. The file must contain an explicit `addr` record to update the Specter
+address label. Any `spendable` value on those output records is handled
+independently for each known outpoint and is not discarded with the unsupported
+output label.
+
 The alternatives are either to retain this adapter boundary or to redesign
 Specter's canonical label model with independent BIP-329 address, transaction,
 and output labels. The latter remains separate from this backwards-compatible
