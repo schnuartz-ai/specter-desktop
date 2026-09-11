@@ -66,6 +66,13 @@ through Specter's existing label mechanism. Unknown addresses and outpoints do
 not create wallet state. Unknown record types and optional fields are ignored
 for forward compatibility.
 
+The optional `origin` descriptor is validated as a string but is not used for
+wallet selection. Specter does not import the transaction labels for which
+BIP-329 primarily defines origin disambiguation, and address/output records
+must already resolve to the selected wallet. Records with different labels for
+the same reference remain conflicting even if their origins differ; Specter
+does not guess which origin should win.
+
 Imported `output.label` values are reported as unsupported rather than written
 to the address store. Conflicting duplicate address or `spendable` records are
 skipped instead of being resolved by file order. Malformed records are validated
@@ -85,6 +92,10 @@ JSON commit succeed. Storage callbacks and balance refreshes run only after
 that commit; their failure does not roll back or misreport the committed frozen
 state. An actual commit failure restores the prior in-memory and persisted state
 and independently attempts to restore Core's prior lock state.
+
+A wallet-specific reentrant lock serializes the complete read, Core RPC, RAM
+update, and wallet commit sequence. The legacy UI freeze toggle uses the same
+lock, so concurrent requests cannot interleave those state transitions.
 
 Outputs used by pending PSBTs are never frozen or unfrozen by this importer.
 A Core lock without a matching Specter frozen marker is protected in the same

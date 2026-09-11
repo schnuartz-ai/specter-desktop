@@ -129,6 +129,7 @@ class Wallet(AbstractWallet):
         :param int change_index: the current index for self.change_address
 
         """
+        self._frozen_state_lock = threading.RLock()
         self.name = name
         self.alias = alias
         self.description = description
@@ -648,7 +649,9 @@ class Wallet(AbstractWallet):
                 if not isinstance(label, str):
                     result.malformed_records += 1
                     continue
-                if "spendable" in record:
+                if "spendable" in record or (
+                    "origin" in record and not isinstance(record["origin"], str)
+                ):
                     result.malformed_records += 1
                     continue
                 addr_labels.setdefault(ref, []).append(label)
@@ -667,8 +670,10 @@ class Wallet(AbstractWallet):
 
             label = record.get("label")
             spendable = record.get("spendable")
-            if (label is not None and not isinstance(label, str)) or (
-                "spendable" in record and not isinstance(spendable, bool)
+            if (
+                (label is not None and not isinstance(label, str))
+                or ("spendable" in record and not isinstance(spendable, bool))
+                or ("origin" in record and not isinstance(record["origin"], str))
             ):
                 # Treat a malformed record atomically: a valid spendable field
                 # must not be applied when another supported field is invalid.
@@ -1175,6 +1180,12 @@ class Wallet(AbstractWallet):
         marker, and ``SpecterError`` for RPC errors.
         """
 
+        with self._frozen_state_lock:
+            return self._set_frozen_state(outpoint, frozen)
+
+    def _set_frozen_state(self, outpoint, frozen):
+        """Apply one frozen-state transaction while holding the wallet lock."""
+
         outpoint = normalize_outpoint(outpoint)
         if outpoint is None or not isinstance(frozen, bool):
             raise SpecterError("Invalid frozen UTXO state request")
@@ -1298,6 +1309,10 @@ class Wallet(AbstractWallet):
         return core_changed or local_changed
 
     def toggle_freeze_utxo(self, utxo_list):
+        with self._frozen_state_lock:
+            return self._toggle_freeze_utxo(utxo_list)
+
+    def _toggle_freeze_utxo(self, utxo_list):
         # utxo = ["txid:vout", "txid:vout"]
         utxo_list_done = []  # Preventing Duplicates server-side
         for utxo in utxo_list:

@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 from types import MethodType
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -84,6 +85,7 @@ def make_wallet(addresses, utxos=None, frozen=None):
     wallet._full_utxo = list(utxos or [])
     wallet.refreshed_utxos = None
     wallet.check_utxo_calls = 0
+    wallet._frozen_state_lock = threading.RLock()
     wallet.frozen_utxo = list(frozen or [])
     wallet.pending_psbts = {}
     wallet.core_locked_outpoints = {
@@ -386,6 +388,55 @@ def test_conflict_reporting_counts_all_affected_records():
     assert report.conflicting_records == 3
 
 
+def test_different_origins_do_not_choose_a_label_for_the_selected_wallet():
+    wallet = make_wallet([make_address(ADDRESS_A, 0)])
+    data = "\n".join(
+        [
+            json.dumps(
+                {
+                    "type": "addr",
+                    "ref": ADDRESS_A,
+                    "label": "Alice",
+                    "origin": "wpkh([deadbeef/84'/0'/0'])",
+                }
+            ),
+            json.dumps(
+                {
+                    "type": "addr",
+                    "ref": ADDRESS_A,
+                    "label": "Bob",
+                    "origin": "wpkh([cafebabe/84'/0'/1'])",
+                }
+            ),
+        ]
+    )
+
+    report = wallet.import_bip329_labels(data)
+
+    assert wallet._addresses[ADDRESS_A]["label"] is None
+    assert report.imported_address_labels == 0
+    assert report.conflicting_records == 2
+
+
+def test_non_string_origin_is_malformed_and_does_not_change_state():
+    wallet = make_wallet([make_address(ADDRESS_A, 0)])
+
+    report = wallet.import_bip329_labels(
+        json.dumps(
+            {
+                "type": "addr",
+                "ref": ADDRESS_A,
+                "label": "Alice",
+                "origin": {"unexpected": "object"},
+            }
+        )
+    )
+
+    assert wallet._addresses[ADDRESS_A]["label"] is None
+    assert report.imported_address_labels == 0
+    assert report.malformed_records == 1
+
+
 def test_import_spendable_false_and_true_uses_existing_frozen_state():
     outpoint = f"{TXID_A}:0"
     wallet = make_wallet(
@@ -407,6 +458,104 @@ def test_import_spendable_false_and_true_uses_existing_frozen_state():
     assert duplicate.updated_frozen_utxos == 0
     assert thaw.updated_frozen_utxos == 1
     assert wallet.frozen_utxo == []
+
+
+def test_concurrent_frozen_state_transactions_are_serialized_per_wallet():
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": True}],
+        frozen=[outpoint],
+    )
+    unfreeze_reached_core = threading.Event()
+    allow_unfreeze_to_commit = threading.Event()
+    freeze_started = threading.Event()
+    freeze_reached_state_read = threading.Event()
+    original_listlockunspent = wallet._rpc.listlockunspent.side_effect
+    original_lockunspent = wallet._rpc.lockunspent.side_effect
+    results = {}
+    errors = []
+
+    def observed_listlockunspent():
+        if threading.current_thread().name == "concurrent-freeze":
+            freeze_reached_state_read.set()
+        return original_listlockunspent()
+
+    def paused_lockunspent(unlock, outputs):
+        result = original_lockunspent(unlock, outputs)
+        if threading.current_thread().name == "concurrent-unfreeze" and unlock:
+            unfreeze_reached_core.set()
+            if not allow_unfreeze_to_commit.wait(timeout=5):
+                raise RuntimeError("test timed out waiting to resume unfreeze")
+        return result
+
+    def change_state(name, frozen):
+        if frozen:
+            freeze_started.set()
+        try:
+            results[name] = wallet.set_frozen_state(outpoint, frozen)
+        except Exception as e:
+            errors.append(e)
+
+    wallet._rpc.listlockunspent.side_effect = observed_listlockunspent
+    wallet._rpc.lockunspent.side_effect = paused_lockunspent
+    unfreeze_thread = threading.Thread(
+        target=change_state,
+        args=("unfreeze", False),
+        name="concurrent-unfreeze",
+    )
+    freeze_thread = threading.Thread(
+        target=change_state,
+        args=("freeze", True),
+        name="concurrent-freeze",
+    )
+
+    unfreeze_thread.start()
+    assert unfreeze_reached_core.wait(timeout=5)
+    freeze_thread.start()
+    assert freeze_started.wait(timeout=5)
+    assert not freeze_reached_state_read.wait(timeout=0.2)
+    allow_unfreeze_to_commit.set()
+    unfreeze_thread.join(timeout=5)
+    freeze_thread.join(timeout=5)
+
+    assert not unfreeze_thread.is_alive()
+    assert not freeze_thread.is_alive()
+    assert freeze_reached_state_read.is_set()
+    assert errors == []
+    assert results == {"unfreeze": True, "freeze": True}
+    assert wallet.frozen_utxo == [outpoint]
+    assert wallet.core_locked_outpoints == {outpoint}
+
+
+def test_legacy_freeze_toggle_uses_the_wallet_frozen_state_lock():
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": False}],
+    )
+    toggle_started = threading.Event()
+    toggle_finished = threading.Event()
+
+    def toggle():
+        toggle_started.set()
+        wallet.toggle_freeze_utxo([outpoint])
+        toggle_finished.set()
+
+    wallet._frozen_state_lock.acquire()
+    toggle_thread = threading.Thread(target=toggle)
+    try:
+        toggle_thread.start()
+        assert toggle_started.wait(timeout=5)
+        assert not toggle_finished.wait(timeout=0.2)
+    finally:
+        wallet._frozen_state_lock.release()
+    toggle_thread.join(timeout=5)
+
+    assert not toggle_thread.is_alive()
+    assert toggle_finished.is_set()
+    assert wallet.frozen_utxo == [outpoint]
+    assert wallet.core_locked_outpoints == {outpoint}
 
 
 def test_spendable_false_repairs_missing_core_lock_for_frozen_utxo():
