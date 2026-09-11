@@ -782,7 +782,11 @@ def addresses(wallet_alias):
 ###### Wallet settings ######
 
 
-@wallets_endpoint.route("/wallet/<wallet_alias>/settings/", methods=["GET", "POST"])
+@wallets_endpoint.route(
+    "/wallet/<wallet_alias>/settings/",
+    methods=["GET", "POST"],
+    endpoint="settings_page",
+)
 # In case of exceptions in the "subactions" POST method handlers, the error-handler
 # will redirect to the same endpoint but GET-method. Specifying them here:
 @wallets_endpoint.route(
@@ -873,14 +877,18 @@ def settings_importaddresslabels(wallet_alias):
                 _("No wallet labels or frozen UTXO states needed updating."),
                 "warning",
             )
-        return redirect(url_for("wallets_endpoint.settings"))
+        return redirect(
+            url_for("wallets_endpoint.settings_page", wallet_alias=wallet_alias)
+        )
     if imported_addresses_len > 1:
         flash(f"Successfully imported {imported_addresses_len} address labels.")
     elif imported_addresses_len == 1:
         flash(f"Successfully imported {imported_addresses_len} address label.")
     else:
         flash("No address labels were imported.")
-    return redirect(url_for("wallets_endpoint.settings"))
+    return redirect(
+        url_for("wallets_endpoint.settings_page", wallet_alias=wallet_alias)
+    )
 
 
 @wallets_endpoint.route(

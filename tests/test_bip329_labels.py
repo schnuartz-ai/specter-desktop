@@ -227,6 +227,7 @@ def test_bip329_download_is_separate_utf8_jsonl_attachment():
 def test_warning_only_bip329_import_is_not_flashed_as_success(monkeypatch):
     wallet = make_wallet([make_address(ADDRESS_A, 0)])
     flashes = []
+    built_endpoints = []
     flask_app = Flask(__name__)
     flask_app.secret_key = "test-only"
     flask_app.specter = SimpleNamespace(
@@ -238,7 +239,12 @@ def test_warning_only_bip329_import_is_not_flashed_as_success(monkeypatch):
         "flash",
         lambda message, category=None: flashes.append((category, message)),
     )
-    monkeypatch.setattr(wallets_module, "url_for", lambda endpoint: "/settings")
+
+    def fake_url_for(endpoint, **values):
+        built_endpoints.append(endpoint)
+        return "/wallet/{}/settings".format(values["wallet_alias"])
+
+    monkeypatch.setattr(wallets_module, "url_for", fake_url_for)
 
     with flask_app.test_request_context(
         method="POST",
@@ -249,12 +255,14 @@ def test_warning_only_bip329_import_is_not_flashed_as_success(monkeypatch):
             ),
         },
     ):
-        settings_importaddresslabels.__wrapped__(wallet.alias)
+        response = settings_importaddresslabels.__wrapped__(wallet.alias)
 
     assert len(flashes) == 1
     assert flashes[0][0] == "warning"
     assert "not imported" in flashes[0][1]
     assert not any(message.startswith("Successfully") for category, message in flashes)
+    assert built_endpoints == ["wallets_endpoint.settings_page"]
+    assert response.location == "/wallet/{}/settings".format(wallet.alias)
 
 
 def test_unicode_and_json_escaping_round_trip():
