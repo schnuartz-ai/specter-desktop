@@ -25,6 +25,33 @@ Label exports contain privacy-sensitive addresses, transaction outpoints, and
 descriptions. Keep them private and delete unencrypted copies when no longer
 needed.
 
+### Why address labels are also exported on outputs
+
+This conversion is intentionally asymmetric. Specter stores an explicit label
+on an address, but also uses that address label as the effective label shown for
+the address's UTXOs. BIP-329 can represent both levels independently. Sparrow's
+BIP-329 importer also applies `addr` and `output` records independently; it does
+not propagate an imported address label to the corresponding outputs.
+
+Consequently, exporting only an `addr` record would preserve the stored Specter
+label but not the UTXO-label semantics users currently see and use for coin
+control. The adapter therefore materializes the same explicit address label on
+each current known output for that address. These records are a derived
+interoperability representation, not evidence that Specter stores independent
+per-output labels.
+
+The reverse conversion is not safe. An external wallet may assign different
+labels to outputs on a reused address, including spent historical outputs.
+Collapsing those distinctions into one Specter address label would destroy
+information and could change the apparent labels of other transactions. For
+that reason, Specter exports the derived `output.label` records but does not
+import arbitrary `output.label` records into its address-only store.
+
+The alternatives are either to retain this adapter boundary or to redesign
+Specter's canonical label model with independent BIP-329 address, transaction,
+and output labels. The latter remains separate from this backwards-compatible
+interoperability change and is tracked by issue #2018.
+
 ## Import and conflicts
 
 `addr` records for addresses in the selected wallet update that address through
