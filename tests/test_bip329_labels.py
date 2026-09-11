@@ -1,4 +1,5 @@
 import json
+import logging
 from types import MethodType
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -111,9 +112,12 @@ def make_wallet(addresses, utxos=None, frozen=None):
     wallet._rpc.listlockunspent.side_effect = listlockunspent
     wallet._rpc.lockunspent.side_effect = lockunspent
     wallet.save_calls = 0
+    wallet.save_error = None
 
     def save_to_file(self):
         self.save_calls += 1
+        if self.save_error is not None:
+            raise self.save_error
 
     wallet.save_to_file = MethodType(save_to_file, wallet)
     wallet.name = "Savings Wallet"
@@ -469,6 +473,57 @@ def test_frozen_state_false_rpc_result_does_not_mutate_or_report_success():
     assert report.updated_frozen_utxos == 0
     assert report.failed_records == 1
     assert wallet.save_calls == 0
+
+
+def test_frozen_state_save_failure_rolls_back_core_and_memory():
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": False}],
+    )
+    wallet.save_error = SpecterError("simulated persistence failure")
+
+    report = wallet.import_bip329_labels(
+        json.dumps({"type": "output", "ref": outpoint, "spendable": False})
+    )
+
+    assert wallet.frozen_utxo == []
+    assert wallet.core_locked_outpoints == set()
+    assert report.updated_frozen_utxos == 0
+    assert report.failed_records == 1
+    assert wallet.save_calls == 1
+    assert [call.args[0] for call in wallet._rpc.lockunspent.call_args_list] == [
+        False,
+        True,
+    ]
+
+
+def test_frozen_state_failed_rollback_logs_critical_without_metadata(caplog):
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": False}],
+    )
+    wallet.save_error = SpecterError("simulated persistence failure")
+
+    def fail_rollback(unlock, outputs):
+        if unlock:
+            raise RuntimeError("simulated rollback failure")
+        wallet.core_locked_outpoints.add(outpoint)
+        return True
+
+    wallet._rpc.lockunspent.side_effect = fail_rollback
+    caplog.set_level(logging.CRITICAL)
+
+    report = wallet.import_bip329_labels(
+        json.dumps({"type": "output", "ref": outpoint, "spendable": False})
+    )
+
+    assert wallet.frozen_utxo == []
+    assert wallet.core_locked_outpoints == {outpoint}
+    assert report.failed_records == 1
+    assert "manual wallet lock verification is required" in caplog.text
+    assert outpoint not in caplog.text
 
 
 def test_bip329_spendable_does_not_touch_pending_psbt_input():

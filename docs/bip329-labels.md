@@ -49,6 +49,12 @@ already-frozen output is imported as `spendable:false`, and changes the local
 marker only after a required Core RPC succeeds. RPC failures are reported and
 never counted as successful updates.
 
+If persisting a changed local marker fails after a successful Core RPC, Specter
+restores the in-memory marker and makes a best-effort compensating RPC to return
+Core to its previous lock state. A failed compensation is logged at critical
+level without including the affected outpoint or label, so operators know that
+manual lock verification is required.
+
 An output used by a pending PSBT is never frozen or unfrozen by a BIP-329 import.
 Such a request is reported as conflicting so the pending transaction's Bitcoin
 Core lock cannot be adopted and later removed accidentally. Other Core-locked

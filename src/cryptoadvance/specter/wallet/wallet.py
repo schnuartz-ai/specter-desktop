@@ -1201,6 +1201,7 @@ class Wallet(AbstractWallet):
         local_entries = [
             ref for ref in self.frozen_utxo if normalize_outpoint(ref) == outpoint
         ]
+        original_frozen_utxo = list(self.frozen_utxo)
         locally_frozen = bool(local_entries)
         locked_in_core = outpoint in core_locked
         if locked_in_core and not locally_frozen:
@@ -1234,7 +1235,26 @@ class Wallet(AbstractWallet):
                     for ref in self.frozen_utxo
                     if normalize_outpoint(ref) != outpoint
                 ]
-            self.save_to_file()
+            try:
+                self.save_to_file()
+            except Exception as e:
+                # Persistence restores the previous wallet file on failure.
+                # Restore RAM as well, then compensate any successful Core RPC.
+                self.frozen_utxo = original_frozen_utxo
+                if core_changed:
+                    try:
+                        rollback_succeeded = self.rpc.lockunspent(
+                            not locked_in_core,
+                            [{"txid": txid, "vout": int(vout)}],
+                        )
+                    except Exception:
+                        rollback_succeeded = False
+                    if rollback_succeeded is not True:
+                        logger.critical(
+                            "Failed to roll back Bitcoin Core frozen UTXO state; "
+                            "manual wallet lock verification is required"
+                        )
+                raise SpecterError("Failed to persist frozen UTXO state") from e
 
         return core_changed or local_changed
 

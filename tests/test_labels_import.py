@@ -1,5 +1,6 @@
 import json, logging, pytest, time, os
 from cryptoadvance.specter.specter import Specter
+from cryptoadvance.specter.specter_error import SpecterError
 from cryptoadvance.specter.wallet import Wallet
 from cryptoadvance.specter.managers.wallet_manager import WalletManager
 
@@ -217,3 +218,45 @@ def test_bip329_spendable_repairs_missing_core_lock(funded_hot_wallet_1: Wallet)
             f"{item['txid']}:{item['vout']}" for item in wallet.rpc.listlockunspent()
         }:
             wallet.rpc.lockunspent(True, [core_utxo])
+
+
+def test_frozen_state_save_failure_rolls_back_core_and_memory(
+    funded_hot_wallet_1: Wallet, monkeypatch
+):
+    wallet = funded_hot_wallet_1
+    wallet.check_utxo()
+    utxo = next(
+        item
+        for item in wallet.full_utxo
+        if not item["locked"]
+        and f"{item['txid']}:{item['vout']}" not in wallet.frozen_utxo
+    )
+    outpoint = f"{utxo['txid']}:{utxo['vout']}"
+    core_utxo = {"txid": utxo["txid"], "vout": utxo["vout"]}
+    original_save = wallet.save_to_file
+
+    def fail_save():
+        raise SpecterError("simulated persistence failure")
+
+    monkeypatch.setattr(wallet, "save_to_file", fail_save)
+    try:
+        report = wallet.import_address_labels(
+            json.dumps({"type": "output", "ref": outpoint, "spendable": False}),
+            return_report=True,
+        )
+
+        assert report.updated_frozen_utxos == 0
+        assert report.failed_records == 1
+        assert outpoint not in wallet.frozen_utxo
+        assert outpoint not in {
+            f"{item['txid']}:{item['vout']}" for item in wallet.rpc.listlockunspent()
+        }
+    finally:
+        monkeypatch.setattr(wallet, "save_to_file", original_save)
+        if outpoint in {
+            f"{item['txid']}:{item['vout']}" for item in wallet.rpc.listlockunspent()
+        }:
+            wallet.rpc.lockunspent(True, [core_utxo])
+        if outpoint in wallet.frozen_utxo:
+            wallet.frozen_utxo.remove(outpoint)
+            wallet.save_to_file()
