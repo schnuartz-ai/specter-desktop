@@ -80,15 +80,21 @@ UTXO set before importing or exporting output state.
 Frozen-state updates reconcile Specter's persisted ownership marker with
 Bitcoin Core's current lock state. The operation is idempotent, repairs a
 missing non-persistent Core lock for an existing Specter freeze, and does not
-record a successful update unless the required Core operation and persistence
-succeed. Failure handling restores the prior in-memory and persisted state
-without repeating the balance refresh, and independently attempts to restore
-Core's prior lock state.
+record a successful update unless the required Core operation and atomic wallet
+JSON commit succeed. Storage callbacks and balance refreshes run only after
+that commit; their failure does not roll back or misreport the committed frozen
+state. An actual commit failure restores the prior in-memory and persisted state
+and independently attempts to restore Core's prior lock state.
 
 Outputs used by pending PSBTs are never frozen or unfrozen by this importer.
-Other Core locks not owned by Specter's frozen list are protected in the same
-way. Such requests are reported as conflicts, preventing the importer from
-adopting or later releasing locks belonging to another operation.
+A Core lock without a matching Specter frozen marker is protected in the same
+way. Such requests are reported as conflicts.
+
+Bitcoin Core does not record an owner for `lockunspent` locks. If Specter has a
+persisted frozen marker for an outpoint, its original Core lock disappears, and
+another process later locks the same outpoint, the two locks are
+indistinguishable. The importer treats the persisted marker as ownership in
+that case. Pending PSBT inputs remain protected independently of this marker.
 
 ## References
 

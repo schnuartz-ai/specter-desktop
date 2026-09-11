@@ -25,7 +25,12 @@ from cryptoadvance.specter.rpc import RpcError
 from ..device import Device
 from ..helpers import get_address_from_dict
 from ..key import Key
-from ..persistence import delete_file, delete_folder, write_json_file
+from ..persistence import (
+    delete_file,
+    delete_folder,
+    storage_callback,
+    write_json_file_atomic,
+)
 from ..specter_error import SpecterError, handle_exception
 from ..util.descriptor import convert_receive_descriptor_to_combined_descriptor
 from ..util.merkleblock import is_valid_merkle_proof
@@ -593,7 +598,8 @@ class Wallet(AbstractWallet):
         are reported but not collapsed into address labels because Specter
         cannot represent their historical, per-output semantics losslessly.
         Output ``spendable`` state maps to the existing frozen UTXO list, except
-        for inputs reserved by pending PSBTs or another Core lock.
+        for inputs reserved by pending PSBTs or a Core lock without a matching
+        persisted Specter freeze marker.
         """
 
         if isinstance(records, str):
@@ -683,10 +689,12 @@ class Wallet(AbstractWallet):
             else:
                 result.conflicting_records += len(labels)
 
-        labels_to_apply = [
-            {"address": address, "label": label}
-            for address, label in sorted(planned_labels.items())
-        ]
+        labels_to_apply = []
+        for address, label in sorted(planned_labels.items()):
+            if self._addresses[address].get("label") == label:
+                result.ignored_records += len(addr_labels[address])
+                continue
+            labels_to_apply.append({"address": address, "label": label})
         if labels_to_apply:
             self._addresses.set_labels(labels_to_apply)
         result.imported_address_labels = len(labels_to_apply)
@@ -1065,8 +1073,13 @@ class Wallet(AbstractWallet):
             psbtid: psbtobj.to_dict() for psbtid, psbtobj in self.pending_psbts.items()
         }
 
+    def _commit_wallet_file(self):
+        """Atomically commit wallet JSON without post-persistence side effects."""
+        write_json_file_atomic(self.to_json(), self.fullpath)
+
     def save_to_file(self):
-        write_json_file(self.to_json(), self.fullpath)
+        self._commit_wallet_file()
+        storage_callback(path=self.fullpath)
         self.update_balance()
 
     def delete_files(self):
@@ -1150,7 +1163,7 @@ class Wallet(AbstractWallet):
                 self.save_to_file()
 
     def set_frozen_state(self, outpoint, frozen):
-        """Set one UTXO's frozen state without adopting another lock owner.
+        """Set one UTXO's frozen state without knowingly adopting another lock.
 
         Bitcoin Core's in-memory lock and Specter's persisted ``frozen_utxo``
         entry are reconciled idempotently. Specter's local state is changed
@@ -1158,7 +1171,8 @@ class Wallet(AbstractWallet):
 
         Returns ``True`` when either state needed updating and ``False`` when
         both were already aligned. Raises ``FrozenStateConflictError`` for a
-        pending-PSBT or foreign Core lock, and ``SpecterError`` for RPC errors.
+        pending-PSBT lock or a Core lock without a persisted Specter ownership
+        marker, and ``SpecterError`` for RPC errors.
         """
 
         outpoint = normalize_outpoint(outpoint)
@@ -1236,15 +1250,13 @@ class Wallet(AbstractWallet):
                     if normalize_outpoint(ref) != outpoint
                 ]
             try:
-                self.save_to_file()
+                self._commit_wallet_file()
             except Exception as e:
-                # save_to_file() writes before refreshing the balance, so an
-                # exception does not imply that the wallet file is unchanged.
-                # Restore RAM and persist that snapshot without another balance
-                # refresh, then compensate any successful Core RPC independently.
+                # The wallet JSON did not commit. Restore RAM and the previous
+                # persisted snapshot, then compensate any successful Core RPC.
                 self.frozen_utxo = original_frozen_utxo
                 try:
-                    write_json_file(self.to_json(), self.fullpath)
+                    self._commit_wallet_file()
                 except Exception:
                     logger.critical(
                         "Failed to roll back persisted frozen UTXO state; "
@@ -1264,6 +1276,24 @@ class Wallet(AbstractWallet):
                             "manual wallet lock verification is required"
                         )
                 raise SpecterError("Failed to persist frozen UTXO state") from e
+
+            # The wallet state is committed. These post-commit side effects
+            # must not make the import appear to have failed or roll back the
+            # now-consistent Core, RAM, and persisted state.
+            try:
+                storage_callback(path=self.fullpath)
+            except Exception:
+                logger.error(
+                    "Frozen UTXO state was committed, but a post-persistence "
+                    "callback failed"
+                )
+            try:
+                self.update_balance()
+            except Exception:
+                logger.error(
+                    "Frozen UTXO state was committed, but the post-commit "
+                    "balance refresh failed"
+                )
 
         return core_changed or local_changed
 

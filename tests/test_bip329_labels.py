@@ -111,15 +111,17 @@ def make_wallet(addresses, utxos=None, frozen=None):
 
     wallet._rpc.listlockunspent.side_effect = listlockunspent
     wallet._rpc.lockunspent.side_effect = lockunspent
-    wallet.save_calls = 0
-    wallet.save_error = None
+    wallet.commit_calls = 0
+    wallet.commit_error = None
 
-    def save_to_file(self):
-        self.save_calls += 1
-        if self.save_error is not None:
-            raise self.save_error
+    def commit_wallet_file(self):
+        self.commit_calls += 1
+        if self.commit_error is not None:
+            raise self.commit_error
 
-    wallet.save_to_file = MethodType(save_to_file, wallet)
+    wallet._commit_wallet_file = MethodType(commit_wallet_file, wallet)
+    wallet.fullpath = "unused-wallet.json"
+    wallet.update_balance = MagicMock()
     wallet.name = "Savings Wallet"
     wallet.alias = "savings_wallet"
     wallet.description = ""
@@ -363,6 +365,9 @@ def test_matching_addr_and_output_records_are_idempotent():
     assert wallet._addresses[ADDRESS_A]["label"] == "Alice"
     assert first.conflicting_records == second.conflicting_records == 0
     assert first.unsupported_output_labels == second.unsupported_output_labels == 1
+    assert first.imported_address_labels == 1
+    assert second.imported_address_labels == 0
+    assert second.ignored_records == 1
 
 
 def test_conflict_reporting_counts_all_affected_records():
@@ -452,7 +457,7 @@ def test_frozen_state_rpc_failure_does_not_mutate_or_report_success(
     assert (outpoint in wallet.core_locked_outpoints) == initially_locked
     assert report.updated_frozen_utxos == 0
     assert report.failed_records == 1
-    assert wallet.save_calls == 0
+    assert wallet.commit_calls == 0
 
 
 def test_frozen_state_false_rpc_result_does_not_mutate_or_report_success():
@@ -472,25 +477,27 @@ def test_frozen_state_false_rpc_result_does_not_mutate_or_report_success():
     assert wallet.core_locked_outpoints == set()
     assert report.updated_frozen_utxos == 0
     assert report.failed_records == 1
-    assert wallet.save_calls == 0
+    assert wallet.commit_calls == 0
 
 
-def test_frozen_state_prewrite_save_failure_rolls_back_core_and_memory(monkeypatch):
+def test_frozen_state_atomic_commit_failure_rolls_back_core_memory_and_file():
     outpoint = f"{TXID_A}:0"
     wallet = make_wallet(
         [make_address(ADDRESS_A, 0)],
         [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": False}],
     )
-    wallet.save_error = SpecterError("simulated persistence failure")
-    wallet.fullpath = "unused-wallet.json"
     wallet.to_json = MethodType(
         lambda self, for_export=False: {"frozen_utxo": list(self.frozen_utxo)},
         wallet,
     )
-    restore_write = MagicMock()
-    monkeypatch.setattr(
-        "cryptoadvance.specter.wallet.wallet.write_json_file", restore_write
-    )
+    committed_snapshots = []
+
+    def fail_commit_then_restore(self):
+        committed_snapshots.append(self.to_json())
+        if len(committed_snapshots) == 1:
+            raise SpecterError("simulated atomic commit failure")
+
+    wallet._commit_wallet_file = MethodType(fail_commit_then_restore, wallet)
 
     report = wallet.import_bip329_labels(
         json.dumps({"type": "output", "ref": outpoint, "spendable": False})
@@ -500,15 +507,17 @@ def test_frozen_state_prewrite_save_failure_rolls_back_core_and_memory(monkeypat
     assert wallet.core_locked_outpoints == set()
     assert report.updated_frozen_utxos == 0
     assert report.failed_records == 1
-    assert wallet.save_calls == 1
-    restore_write.assert_called_once_with({"frozen_utxo": []}, "unused-wallet.json")
+    assert committed_snapshots == [
+        {"frozen_utxo": [outpoint]},
+        {"frozen_utxo": []},
+    ]
     assert [call.args[0] for call in wallet._rpc.lockunspent.call_args_list] == [
         False,
         True,
     ]
 
 
-def test_frozen_state_post_write_failure_rolls_back_core_memory_and_file(tmp_path):
+def test_frozen_state_post_commit_balance_failure_keeps_committed_state(tmp_path):
     outpoint = f"{TXID_A}:0"
     wallet = make_wallet(
         [make_address(ADDRESS_A, 0)],
@@ -520,6 +529,7 @@ def test_frozen_state_post_write_failure_rolls_back_core_memory_and_file(tmp_pat
         wallet,
     )
     wallet.update_balance = MethodType(lambda self: None, wallet)
+    wallet._commit_wallet_file = MethodType(Wallet._commit_wallet_file, wallet)
     wallet.save_to_file = MethodType(Wallet.save_to_file, wallet)
     wallet.save_to_file()
     with open(wallet.fullpath, encoding="utf-8") as wallet_file:
@@ -535,39 +545,72 @@ def test_frozen_state_post_write_failure_rolls_back_core_memory_and_file(tmp_pat
     )
 
     with open(wallet.fullpath, encoding="utf-8") as wallet_file:
-        restored_wallet_json = json.load(wallet_file)
-    assert wallet.frozen_utxo == []
-    assert wallet.core_locked_outpoints == set()
-    assert restored_wallet_json == original_wallet_json
-    assert report.updated_frozen_utxos == 0
-    assert report.failed_records == 1
+        committed_wallet_json = json.load(wallet_file)
+    assert original_wallet_json == {"frozen_utxo": []}
+    assert wallet.frozen_utxo == [outpoint]
+    assert wallet.core_locked_outpoints == {outpoint}
+    assert committed_wallet_json == {"frozen_utxo": [outpoint]}
+    assert report.updated_frozen_utxos == 1
+    assert report.failed_records == 0
     assert [call.args[0] for call in wallet._rpc.lockunspent.call_args_list] == [
         False,
-        True,
     ]
 
 
-def test_frozen_state_failed_file_rollback_logs_critical_without_metadata(
-    caplog, monkeypatch
+def test_frozen_state_post_commit_callback_failure_keeps_committed_state(
+    caplog, monkeypatch, tmp_path
 ):
     outpoint = f"{TXID_A}:0"
     wallet = make_wallet(
         [make_address(ADDRESS_A, 0)],
         [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": False}],
     )
-    wallet.save_error = SpecterError("simulated persistence failure")
-    wallet.fullpath = "unused-wallet.json"
+    wallet.fullpath = str(tmp_path / "wallet.json")
+    wallet.to_json = MethodType(
+        lambda self, for_export=False: {"frozen_utxo": list(self.frozen_utxo)},
+        wallet,
+    )
+    wallet._commit_wallet_file = MethodType(Wallet._commit_wallet_file, wallet)
+    wallet.update_balance = MagicMock()
+
+    def fail_callback(mode="write", path=None):
+        raise SpecterError("simulated post-commit callback failure")
+
+    monkeypatch.setattr(
+        "cryptoadvance.specter.wallet.wallet.storage_callback", fail_callback
+    )
+    caplog.set_level(logging.ERROR)
+
+    report = wallet.import_bip329_labels(
+        json.dumps({"type": "output", "ref": outpoint, "spendable": False})
+    )
+
+    with open(wallet.fullpath, encoding="utf-8") as wallet_file:
+        assert json.load(wallet_file) == {"frozen_utxo": [outpoint]}
+    assert wallet.frozen_utxo == [outpoint]
+    assert wallet.core_locked_outpoints == {outpoint}
+    assert report.updated_frozen_utxos == 1
+    assert report.failed_records == 0
+    wallet.update_balance.assert_called_once_with()
+    assert "post-persistence callback failed" in caplog.text
+    assert outpoint not in caplog.text
+
+
+def test_frozen_state_failed_file_rollback_logs_critical_without_metadata(caplog):
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": False}],
+    )
     wallet.to_json = MethodType(
         lambda self, for_export=False: {"frozen_utxo": list(self.frozen_utxo)},
         wallet,
     )
 
-    def fail_restore_write(content, path):
+    def fail_commit_and_restore(self):
         raise SpecterError("simulated persisted-state rollback failure")
 
-    monkeypatch.setattr(
-        "cryptoadvance.specter.wallet.wallet.write_json_file", fail_restore_write
-    )
+    wallet._commit_wallet_file = MethodType(fail_commit_and_restore, wallet)
     caplog.set_level(logging.CRITICAL)
 
     report = wallet.import_bip329_labels(
@@ -585,24 +628,24 @@ def test_frozen_state_failed_file_rollback_logs_critical_without_metadata(
     ]
 
 
-def test_frozen_state_failed_core_rollback_logs_critical_without_metadata(
-    caplog, monkeypatch
-):
+def test_frozen_state_failed_core_rollback_logs_critical_without_metadata(caplog):
     outpoint = f"{TXID_A}:0"
     wallet = make_wallet(
         [make_address(ADDRESS_A, 0)],
         [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": False}],
     )
-    wallet.save_error = SpecterError("simulated persistence failure")
-    wallet.fullpath = "unused-wallet.json"
     wallet.to_json = MethodType(
         lambda self, for_export=False: {"frozen_utxo": list(self.frozen_utxo)},
         wallet,
     )
-    restore_write = MagicMock()
-    monkeypatch.setattr(
-        "cryptoadvance.specter.wallet.wallet.write_json_file", restore_write
-    )
+    committed_snapshots = []
+
+    def fail_commit_then_restore(self):
+        committed_snapshots.append(self.to_json())
+        if len(committed_snapshots) == 1:
+            raise SpecterError("simulated atomic commit failure")
+
+    wallet._commit_wallet_file = MethodType(fail_commit_then_restore, wallet)
 
     def fail_rollback(unlock, outputs):
         if unlock:
@@ -620,7 +663,10 @@ def test_frozen_state_failed_core_rollback_logs_critical_without_metadata(
     assert wallet.frozen_utxo == []
     assert wallet.core_locked_outpoints == {outpoint}
     assert report.failed_records == 1
-    restore_write.assert_called_once_with({"frozen_utxo": []}, "unused-wallet.json")
+    assert committed_snapshots == [
+        {"frozen_utxo": [outpoint]},
+        {"frozen_utxo": []},
+    ]
     assert "manual wallet lock verification is required" in caplog.text
     assert outpoint not in caplog.text
 
@@ -790,6 +836,20 @@ def test_legacy_json_with_type_key_is_not_misdetected_as_bip329():
     assert not report.is_bip329
     assert report.imported_address_labels == 1
     assert wallet._addresses[ADDRESS_A]["label"] == "Alice"
+
+
+def test_document_with_only_unknown_future_type_is_detected_and_ignored():
+    wallet = make_wallet([make_address(ADDRESS_A, 0)])
+
+    report = wallet.import_address_labels(
+        json.dumps({"type": "future-type", "ref": "future-ref", "label": "Alice"}),
+        return_report=True,
+    )
+
+    assert report.is_bip329
+    assert report.imported_address_labels == 0
+    assert report.ignored_records == 1
+    assert wallet._addresses[ADDRESS_A]["label"] is None
 
 
 @pytest.mark.parametrize("payload", ["[]", '{"address": ["not a label"]}', "not json"])

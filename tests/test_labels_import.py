@@ -117,6 +117,7 @@ def test_bip329_import_export_and_frozen_state(funded_hot_wallet_1: Wallet):
     } in exported
 
     duplicate = wallet.import_address_labels(data, return_report=True)
+    assert duplicate.imported_address_labels == 0
     assert duplicate.updated_frozen_utxos == 0
 
     thaw = wallet.import_address_labels(
@@ -220,7 +221,7 @@ def test_bip329_spendable_repairs_missing_core_lock(funded_hot_wallet_1: Wallet)
             wallet.rpc.lockunspent(True, [core_utxo])
 
 
-def test_frozen_state_post_write_failure_rolls_back_core_memory_and_file(
+def test_frozen_state_post_commit_balance_failure_keeps_committed_state(
     funded_hot_wallet_1: Wallet, monkeypatch
 ):
     wallet = funded_hot_wallet_1
@@ -233,8 +234,6 @@ def test_frozen_state_post_write_failure_rolls_back_core_memory_and_file(
     )
     outpoint = f"{utxo['txid']}:{utxo['vout']}"
     core_utxo = {"txid": utxo["txid"], "vout": utxo["vout"]}
-    with open(wallet.fullpath, encoding="utf-8") as wallet_file:
-        original_wallet_json = json.load(wallet_file)
     original_update_balance = wallet.update_balance
 
     def fail_update_balance():
@@ -247,14 +246,14 @@ def test_frozen_state_post_write_failure_rolls_back_core_memory_and_file(
             return_report=True,
         )
 
-        assert report.updated_frozen_utxos == 0
-        assert report.failed_records == 1
-        assert outpoint not in wallet.frozen_utxo
-        assert outpoint not in {
+        assert report.updated_frozen_utxos == 1
+        assert report.failed_records == 0
+        assert outpoint in wallet.frozen_utxo
+        assert outpoint in {
             f"{item['txid']}:{item['vout']}" for item in wallet.rpc.listlockunspent()
         }
         with open(wallet.fullpath, encoding="utf-8") as wallet_file:
-            assert json.load(wallet_file) == original_wallet_json
+            assert outpoint in json.load(wallet_file)["frozen_utxo"]
     finally:
         monkeypatch.setattr(wallet, "update_balance", original_update_balance)
         if outpoint in {

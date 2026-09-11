@@ -81,12 +81,13 @@ def parse_bip329_jsonl(
             result.malformed_records += 1
             continue
 
-        # Require one structurally valid, currently defined BIP-329 record
-        # before taking this document away from Specter's legacy importers.
+        # A string type/ref pair is the common BIP-329 record envelope. Detect
+        # unknown future types as BIP-329 too so they can be ignored as required
+        # by the specification. Requiring both fields avoids diverting legacy
+        # JSON objects merely because they contain a key named "type".
         if (
             isinstance(record, dict)
             and isinstance(record.get("type"), str)
-            and record["type"] in BIP329_TYPES
             and isinstance(record.get("ref"), str)
         ):
             detected = True
