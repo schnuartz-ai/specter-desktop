@@ -159,13 +159,13 @@ def _write_json_file(content, path, lock=None):
             )
 
 
-def write_json_file_atomic(content, path, lock=None):
-    """Commit JSON to disk without running post-persistence callbacks."""
+def write_json_file_without_callback(content, path, lock=None):
+    """Write and verify JSON without running post-persistence callbacks."""
     _write_json_file(content, path, lock)
 
 
 def write_json_file(content, path, lock=None):
-    write_json_file_atomic(content, path, lock)
+    write_json_file_without_callback(content, path, lock)
     storage_callback(path=path)
 
 

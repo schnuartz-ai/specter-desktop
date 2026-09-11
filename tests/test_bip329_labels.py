@@ -17,7 +17,7 @@ from cryptoadvance.specter.specter_error import SpecterError
 from cryptoadvance.specter.wallet import bip329
 from cryptoadvance.specter.wallet.addresslist import Address, AddressList
 from cryptoadvance.specter.wallet.bip329 import parse_bip329_jsonl
-from cryptoadvance.specter.wallet.wallet import Wallet
+from cryptoadvance.specter.wallet.wallet import FrozenStateConflictError, Wallet
 
 
 ADDRESS_A = "bc1q34aq5drpuwy3wgl9lhup9892qp6svr8ldzyy7c"
@@ -85,7 +85,7 @@ def make_wallet(addresses, utxos=None, frozen=None):
     wallet._full_utxo = list(utxos or [])
     wallet.refreshed_utxos = None
     wallet.check_utxo_calls = 0
-    wallet._frozen_state_lock = threading.RLock()
+    wallet._utxo_state_lock = threading.RLock()
     wallet.frozen_utxo = list(frozen or [])
     wallet.pending_psbts = {}
     wallet.core_locked_outpoints = {
@@ -116,12 +116,12 @@ def make_wallet(addresses, utxos=None, frozen=None):
     wallet.commit_calls = 0
     wallet.commit_error = None
 
-    def commit_wallet_file(self):
+    def persist_wallet_file(self):
         self.commit_calls += 1
         if self.commit_error is not None:
             raise self.commit_error
 
-    wallet._commit_wallet_file = MethodType(commit_wallet_file, wallet)
+    wallet._persist_wallet_file = MethodType(persist_wallet_file, wallet)
     wallet.fullpath = "unused-wallet.json"
     wallet.update_balance = MagicMock()
     wallet.name = "Savings Wallet"
@@ -528,7 +528,7 @@ def test_concurrent_frozen_state_transactions_are_serialized_per_wallet():
     assert wallet.core_locked_outpoints == {outpoint}
 
 
-def test_legacy_freeze_toggle_uses_the_wallet_frozen_state_lock():
+def test_legacy_freeze_toggle_uses_the_wallet_utxo_state_lock():
     outpoint = f"{TXID_A}:0"
     wallet = make_wallet(
         [make_address(ADDRESS_A, 0)],
@@ -542,20 +542,209 @@ def test_legacy_freeze_toggle_uses_the_wallet_frozen_state_lock():
         wallet.toggle_freeze_utxo([outpoint])
         toggle_finished.set()
 
-    wallet._frozen_state_lock.acquire()
+    wallet._utxo_state_lock.acquire()
     toggle_thread = threading.Thread(target=toggle)
     try:
         toggle_thread.start()
         assert toggle_started.wait(timeout=5)
         assert not toggle_finished.wait(timeout=0.2)
     finally:
-        wallet._frozen_state_lock.release()
+        wallet._utxo_state_lock.release()
     toggle_thread.join(timeout=5)
 
     assert not toggle_thread.is_alive()
     assert toggle_finished.is_set()
     assert wallet.frozen_utxo == [outpoint]
     assert wallet.core_locked_outpoints == {outpoint}
+
+
+def test_pending_psbt_save_is_serialized_against_freeze():
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": False}],
+    )
+    wallet.save_to_file = MagicMock()
+    psbt = SimpleNamespace(
+        txid="pending",
+        utxo_dict=lambda: [{"txid": TXID_A, "vout": 0}],
+    )
+    save_reached_core = threading.Event()
+    allow_save_to_finish = threading.Event()
+    freeze_reached_transaction = threading.Event()
+    original_lockunspent = wallet._rpc.lockunspent.side_effect
+    original_set_frozen_state = wallet._set_frozen_state
+    errors = []
+
+    def paused_lockunspent(unlock, outputs):
+        result = original_lockunspent(unlock, outputs)
+        if threading.current_thread().name == "pending-save":
+            save_reached_core.set()
+            if not allow_save_to_finish.wait(timeout=5):
+                raise RuntimeError("test timed out waiting to finish pending save")
+        return result
+
+    def observed_set_frozen_state(self, ref, frozen):
+        freeze_reached_transaction.set()
+        return original_set_frozen_state(ref, frozen)
+
+    def save_pending():
+        try:
+            wallet.save_pending_psbt(psbt)
+        except Exception as e:
+            errors.append(e)
+
+    def freeze():
+        try:
+            wallet.set_frozen_state(outpoint, True)
+        except Exception as e:
+            errors.append(e)
+
+    wallet._rpc.lockunspent.side_effect = paused_lockunspent
+    wallet._set_frozen_state = MethodType(observed_set_frozen_state, wallet)
+    save_thread = threading.Thread(target=save_pending, name="pending-save")
+    freeze_thread = threading.Thread(target=freeze, name="concurrent-freeze")
+
+    save_thread.start()
+    assert save_reached_core.wait(timeout=5)
+    freeze_thread.start()
+    assert not freeze_reached_transaction.wait(timeout=0.2)
+    allow_save_to_finish.set()
+    save_thread.join(timeout=5)
+    freeze_thread.join(timeout=5)
+
+    assert not save_thread.is_alive()
+    assert not freeze_thread.is_alive()
+    assert freeze_reached_transaction.is_set()
+    assert len(errors) == 1
+    assert isinstance(errors[0], FrozenStateConflictError)
+    assert set(wallet.pending_psbts) == {"pending"}
+    assert wallet.frozen_utxo == []
+    assert wallet.core_locked_outpoints == {outpoint}
+
+
+def test_pending_psbt_delete_is_serialized_against_unfreeze():
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": True}],
+        frozen=[outpoint],
+    )
+    wallet.pending_psbts = {
+        "pending": SimpleNamespace(utxo_dict=lambda: [{"txid": TXID_A, "vout": 0}])
+    }
+    delete_reached_save = threading.Event()
+    allow_delete_to_finish = threading.Event()
+    unfreeze_reached_transaction = threading.Event()
+    original_set_frozen_state = wallet._set_frozen_state
+    errors = []
+
+    def paused_save(self):
+        delete_reached_save.set()
+        if not allow_delete_to_finish.wait(timeout=5):
+            raise RuntimeError("test timed out waiting to finish pending delete")
+
+    def observed_set_frozen_state(self, ref, frozen):
+        unfreeze_reached_transaction.set()
+        return original_set_frozen_state(ref, frozen)
+
+    def delete_pending():
+        try:
+            wallet.delete_pending_psbt("pending")
+        except Exception as e:
+            errors.append(e)
+
+    def unfreeze():
+        try:
+            wallet.set_frozen_state(outpoint, False)
+        except Exception as e:
+            errors.append(e)
+
+    wallet.save_to_file = MethodType(paused_save, wallet)
+    wallet._set_frozen_state = MethodType(observed_set_frozen_state, wallet)
+    delete_thread = threading.Thread(target=delete_pending, name="pending-delete")
+    unfreeze_thread = threading.Thread(target=unfreeze, name="concurrent-unfreeze")
+
+    delete_thread.start()
+    assert delete_reached_save.wait(timeout=5)
+    assert wallet.pending_psbts == {}
+    assert wallet.frozen_utxo == [outpoint]
+    assert wallet.core_locked_outpoints == {outpoint}
+    unfreeze_thread.start()
+    assert not unfreeze_reached_transaction.wait(timeout=0.2)
+    allow_delete_to_finish.set()
+    delete_thread.join(timeout=5)
+    unfreeze_thread.join(timeout=5)
+
+    assert not delete_thread.is_alive()
+    assert not unfreeze_thread.is_alive()
+    assert unfreeze_reached_transaction.is_set()
+    assert errors == []
+    assert wallet.pending_psbts == {}
+    assert wallet.frozen_utxo == []
+    assert wallet.core_locked_outpoints == set()
+
+
+def test_deleting_pending_psbt_keeps_lock_for_frozen_outpoint():
+    outpoint = f"{TXID_A}:0"
+    utxo = {"txid": TXID_A, "vout": 0}
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{**utxo, "address": ADDRESS_A, "locked": True}],
+        frozen=[outpoint],
+    )
+    wallet.save_to_file = MagicMock()
+    wallet.pending_psbts = {
+        "first": SimpleNamespace(utxo_dict=lambda: [utxo]),
+    }
+
+    wallet.delete_pending_psbt("first")
+
+    assert wallet.pending_psbts == {}
+    assert wallet.frozen_utxo == [outpoint]
+    assert wallet.core_locked_outpoints == {outpoint}
+    wallet._rpc.lockunspent.assert_not_called()
+
+
+def test_deleting_pending_psbt_keeps_lock_for_other_pending_psbt():
+    outpoint = f"{TXID_A}:0"
+    utxo = {"txid": TXID_A, "vout": 0}
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{**utxo, "address": ADDRESS_A, "locked": True}],
+    )
+    wallet.save_to_file = MagicMock()
+    wallet.pending_psbts = {
+        "first": SimpleNamespace(utxo_dict=lambda: [utxo]),
+        "second": SimpleNamespace(utxo_dict=lambda: [utxo]),
+    }
+
+    wallet.delete_pending_psbt("first")
+
+    assert set(wallet.pending_psbts) == {"second"}
+    assert wallet.frozen_utxo == []
+    assert wallet.core_locked_outpoints == {outpoint}
+    wallet._rpc.lockunspent.assert_not_called()
+
+
+def test_deleting_last_pending_psbt_unlocks_unowned_outpoint():
+    outpoint = f"{TXID_A}:0"
+    utxo = {"txid": TXID_A, "vout": 0}
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{**utxo, "address": ADDRESS_A, "locked": True}],
+    )
+    wallet.save_to_file = MagicMock()
+    wallet.pending_psbts = {
+        "pending": SimpleNamespace(utxo_dict=lambda: [utxo]),
+    }
+
+    wallet.delete_pending_psbt("pending")
+
+    assert wallet.pending_psbts == {}
+    assert wallet.frozen_utxo == []
+    assert wallet.core_locked_outpoints == set()
+    wallet._rpc.lockunspent.assert_called_once_with(True, [utxo])
 
 
 def test_spendable_false_repairs_missing_core_lock_for_frozen_utxo():
@@ -629,7 +818,7 @@ def test_frozen_state_false_rpc_result_does_not_mutate_or_report_success():
     assert wallet.commit_calls == 0
 
 
-def test_frozen_state_atomic_commit_failure_rolls_back_core_memory_and_file():
+def test_frozen_state_wallet_write_failure_rolls_back_core_memory_and_file():
     outpoint = f"{TXID_A}:0"
     wallet = make_wallet(
         [make_address(ADDRESS_A, 0)],
@@ -644,9 +833,9 @@ def test_frozen_state_atomic_commit_failure_rolls_back_core_memory_and_file():
     def fail_commit_then_restore(self):
         committed_snapshots.append(self.to_json())
         if len(committed_snapshots) == 1:
-            raise SpecterError("simulated atomic commit failure")
+            raise SpecterError("simulated wallet write failure")
 
-    wallet._commit_wallet_file = MethodType(fail_commit_then_restore, wallet)
+    wallet._persist_wallet_file = MethodType(fail_commit_then_restore, wallet)
 
     report = wallet.import_bip329_labels(
         json.dumps({"type": "output", "ref": outpoint, "spendable": False})
@@ -678,7 +867,7 @@ def test_frozen_state_post_commit_balance_failure_keeps_committed_state(tmp_path
         wallet,
     )
     wallet.update_balance = MethodType(lambda self: None, wallet)
-    wallet._commit_wallet_file = MethodType(Wallet._commit_wallet_file, wallet)
+    wallet._persist_wallet_file = MethodType(Wallet._persist_wallet_file, wallet)
     wallet.save_to_file = MethodType(Wallet.save_to_file, wallet)
     wallet.save_to_file()
     with open(wallet.fullpath, encoding="utf-8") as wallet_file:
@@ -719,7 +908,7 @@ def test_frozen_state_post_commit_callback_failure_keeps_committed_state(
         lambda self, for_export=False: {"frozen_utxo": list(self.frozen_utxo)},
         wallet,
     )
-    wallet._commit_wallet_file = MethodType(Wallet._commit_wallet_file, wallet)
+    wallet._persist_wallet_file = MethodType(Wallet._persist_wallet_file, wallet)
     wallet.update_balance = MagicMock()
 
     def fail_callback(mode="write", path=None):
@@ -759,7 +948,7 @@ def test_frozen_state_failed_file_rollback_logs_critical_without_metadata(caplog
     def fail_commit_and_restore(self):
         raise SpecterError("simulated persisted-state rollback failure")
 
-    wallet._commit_wallet_file = MethodType(fail_commit_and_restore, wallet)
+    wallet._persist_wallet_file = MethodType(fail_commit_and_restore, wallet)
     caplog.set_level(logging.CRITICAL)
 
     report = wallet.import_bip329_labels(
@@ -792,9 +981,9 @@ def test_frozen_state_failed_core_rollback_logs_critical_without_metadata(caplog
     def fail_commit_then_restore(self):
         committed_snapshots.append(self.to_json())
         if len(committed_snapshots) == 1:
-            raise SpecterError("simulated atomic commit failure")
+            raise SpecterError("simulated wallet write failure")
 
-    wallet._commit_wallet_file = MethodType(fail_commit_then_restore, wallet)
+    wallet._persist_wallet_file = MethodType(fail_commit_then_restore, wallet)
 
     def fail_rollback(unlock, outputs):
         if unlock:

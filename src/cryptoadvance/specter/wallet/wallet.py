@@ -29,7 +29,7 @@ from ..persistence import (
     delete_file,
     delete_folder,
     storage_callback,
-    write_json_file_atomic,
+    write_json_file_without_callback,
 )
 from ..specter_error import SpecterError, handle_exception
 from ..util.descriptor import convert_receive_descriptor_to_combined_descriptor
@@ -129,7 +129,10 @@ class Wallet(AbstractWallet):
         :param int change_index: the current index for self.change_address
 
         """
-        self._frozen_state_lock = threading.RLock()
+        # Bitcoin Core exposes one owner-less lock set for both frozen coins and
+        # pending PSBT inputs. Serialize every mutation of either kind so their
+        # ownership markers cannot race each other.
+        self._utxo_state_lock = threading.RLock()
         self.name = name
         self.alias = alias
         self.description = description
@@ -1074,16 +1077,18 @@ class Wallet(AbstractWallet):
         return o
 
     def pending_psbts_dict(self):
-        return {
-            psbtid: psbtobj.to_dict() for psbtid, psbtobj in self.pending_psbts.items()
-        }
+        with self._utxo_state_lock:
+            return {
+                psbtid: psbtobj.to_dict()
+                for psbtid, psbtobj in self.pending_psbts.items()
+            }
 
-    def _commit_wallet_file(self):
-        """Atomically commit wallet JSON without post-persistence side effects."""
-        write_json_file_atomic(self.to_json(), self.fullpath)
+    def _persist_wallet_file(self):
+        """Write and verify wallet JSON without post-persistence side effects."""
+        write_json_file_without_callback(self.to_json(), self.fullpath)
 
     def save_to_file(self):
-        self._commit_wallet_file()
+        self._persist_wallet_file()
         storage_callback(path=self.fullpath)
         self.update_balance()
 
@@ -1134,38 +1139,67 @@ class Wallet(AbstractWallet):
         checks if pending psbts try to spent them,
         if so - unlocks other inputs and deletes these psbts.
         """
-        # check if we have pending psbts
-        if len(self.pending_psbts) == 0:
-            return
-        # make sure None didn't get here
-        txs = [tx for tx in txs if tx is not None]
-        # all inputs in transactions
-        inputs = sum([self.TxCls.from_string(hextx).vin for hextx in txs], [])
-        # all unique utxos spent in these transactions
-        utxos = set([(vin.txid, vin.vout) for vin in inputs])
-        # get psbt ids we need to delete
-        psbtids = []
-        for psbtid, psbt in self.pending_psbts.items():
-            psbtutxos = [(inp.txid, inp.vout) for inp in psbt.inputs]
-            for utxo in psbtutxos:
-                if utxo in utxos:
-                    psbtids.append(psbtid)
-                    break
-        if len(psbtids) > 0:
-            for psbtid in psbtids:
-                self.delete_pending_psbt(psbtid, save=False)
-            self.save_to_file()
+        with self._utxo_state_lock:
+            # check if we have pending psbts
+            if len(self.pending_psbts) == 0:
+                return
+            # make sure None didn't get here
+            txs = [tx for tx in txs if tx is not None]
+            # all inputs in transactions
+            inputs = sum([self.TxCls.from_string(hextx).vin for hextx in txs], [])
+            # all unique utxos spent in these transactions
+            utxos = set([(vin.txid, vin.vout) for vin in inputs])
+            # get psbt ids we need to delete
+            psbtids = []
+            for psbtid, psbt in self.pending_psbts.items():
+                psbtutxos = [(inp.txid, inp.vout) for inp in psbt.inputs]
+                for utxo in psbtutxos:
+                    if utxo in utxos:
+                        psbtids.append(psbtid)
+                        break
+            if len(psbtids) > 0:
+                for psbtid in psbtids:
+                    self.delete_pending_psbt(psbtid, save=False)
+                self.save_to_file()
 
     def delete_pending_psbt(self, txid, save=True):
-        if txid and txid in self.pending_psbts:
-            try:
-                self.rpc.lockunspent(True, self.pending_psbts[txid].utxo_dict())
-            except RpcError as e:
-                # UTXO was probably spent
-                logger.warning(str(e))
-            del self.pending_psbts[txid]
-            if save:
-                self.save_to_file()
+        with self._utxo_state_lock:
+            if txid and txid in self.pending_psbts:
+                # A Core lock has no owner. Do not unlock an input that remains
+                # protected by a Specter freeze or another pending PSBT.
+                protected_outpoints = {
+                    normalized
+                    for normalized in (
+                        normalize_outpoint(ref) for ref in self.frozen_utxo
+                    )
+                    if normalized is not None
+                }
+                for other_txid, other_psbt in self.pending_psbts.items():
+                    if other_txid == txid:
+                        continue
+                    for utxo in other_psbt.utxo_dict():
+                        normalized = normalize_outpoint(
+                            f"{utxo.get('txid')}:{utxo.get('vout')}"
+                        )
+                        if normalized is not None:
+                            protected_outpoints.add(normalized)
+
+                unlock_utxos = []
+                for utxo in self.pending_psbts[txid].utxo_dict():
+                    normalized = normalize_outpoint(
+                        f"{utxo.get('txid')}:{utxo.get('vout')}"
+                    )
+                    if normalized not in protected_outpoints:
+                        unlock_utxos.append(utxo)
+                if unlock_utxos:
+                    try:
+                        self.rpc.lockunspent(True, unlock_utxos)
+                    except RpcError as e:
+                        # UTXO was probably spent
+                        logger.warning(str(e))
+                del self.pending_psbts[txid]
+                if save:
+                    self.save_to_file()
 
     def set_frozen_state(self, outpoint, frozen):
         """Set one UTXO's frozen state without knowingly adopting another lock.
@@ -1180,7 +1214,7 @@ class Wallet(AbstractWallet):
         marker, and ``SpecterError`` for RPC errors.
         """
 
-        with self._frozen_state_lock:
+        with self._utxo_state_lock:
             return self._set_frozen_state(outpoint, frozen)
 
     def _set_frozen_state(self, outpoint, frozen):
@@ -1261,13 +1295,13 @@ class Wallet(AbstractWallet):
                     if normalize_outpoint(ref) != outpoint
                 ]
             try:
-                self._commit_wallet_file()
+                self._persist_wallet_file()
             except Exception as e:
                 # The wallet JSON did not commit. Restore RAM and the previous
                 # persisted snapshot, then compensate any successful Core RPC.
                 self.frozen_utxo = original_frozen_utxo
                 try:
-                    self._commit_wallet_file()
+                    self._persist_wallet_file()
                 except Exception:
                     logger.critical(
                         "Failed to roll back persisted frozen UTXO state; "
@@ -1309,7 +1343,7 @@ class Wallet(AbstractWallet):
         return core_changed or local_changed
 
     def toggle_freeze_utxo(self, utxo_list):
-        with self._frozen_state_lock:
+        with self._utxo_state_lock:
             return self._toggle_freeze_utxo(utxo_list)
 
     def _toggle_freeze_utxo(self, utxo_list):
@@ -1345,23 +1379,25 @@ class Wallet(AbstractWallet):
         self.save_to_file()
 
     def update_pending_psbt(self, psbt, txid, raw):
-        if txid not in self.pending_psbts:
-            raise SpecterError("Can't find pending PSBT with this txid")
+        with self._utxo_state_lock:
+            if txid not in self.pending_psbts:
+                raise SpecterError("Can't find pending PSBT with this txid")
 
-        cur_psbt = self.pending_psbts[txid]
-        cur_psbt.update(psbt, raw)
-        self.save_to_file()
-        return cur_psbt.to_dict()
+            cur_psbt = self.pending_psbts[txid]
+            cur_psbt.update(psbt, raw)
+            self.save_to_file()
+            return cur_psbt.to_dict()
 
     def save_pending_psbt(self, psbt):
-        self.pending_psbts[psbt.txid] = psbt
-        try:
-            self.rpc.lockunspent(False, psbt.utxo_dict())
-        except:
-            logger.debug(
-                "Failed to lock UTXO for transaction, might be fine if the transaction is an RBF."
-            )
-        self.save_to_file()
+        with self._utxo_state_lock:
+            self.pending_psbts[psbt.txid] = psbt
+            try:
+                self.rpc.lockunspent(False, psbt.utxo_dict())
+            except:
+                logger.debug(
+                    "Failed to lock UTXO for transaction, might be fine if the transaction is an RBF."
+                )
+            self.save_to_file()
 
     def txlist(
         self,
