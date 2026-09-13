@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from embit import script
+from embit.transaction import Transaction, TransactionInput, TransactionOutput
 from flask import Flask
 
 from cryptoadvance.specter.server_endpoints.wallets import wallets as wallets_module
@@ -1155,6 +1157,103 @@ def test_import_and_export_refresh_stale_utxo_cache():
     assert import_wallet.check_utxo_calls == 1
     assert import_wallet.frozen_utxo == [f"{TXID_A}:0"]
     assert report.updated_frozen_utxos == 1
+
+
+def test_locked_utxo_keeps_address_amount_and_bip329_output():
+    """Core/Spectrum listunspent omits locks; the outpoint must still export."""
+    amount_sats = 38759
+    amount = amount_sats * 1e-8
+    raw_tx = Transaction(
+        vin=[TransactionInput(bytes(32), 0)],
+        vout=[
+            TransactionOutput(amount_sats, script.address_to_scriptpubkey(ADDRESS_A))
+        ],
+    )
+    txid = raw_tx.txid().hex()
+    outpoint = f"{txid}:0"
+    wallet = make_wallet([make_address(ADDRESS_A, 0, "Alice")])
+    wallet.check_utxo = MethodType(Wallet.check_utxo, wallet)
+    wallet.manager = SimpleNamespace(chain="main")
+    wallet._transactions = MagicMock()
+    wallet._transactions.get_transactions.return_value = [
+        {"txid": txid, "time": 1, "address": ADDRESS_A, "label": "Alice"}
+    ]
+    wallet._rpc.listunspent.return_value = [
+        {"txid": txid, "vout": 0, "address": ADDRESS_A, "amount": amount}
+    ]
+    wallet._rpc.gettransaction.return_value = {
+        "details": [{"vout": 0, "address": ADDRESS_A, "amount": amount}],
+        "hex": str(raw_tx),
+    }
+
+    wallet.check_utxo()
+    assert len(wallet.full_utxo) == 1
+    assert wallet.full_utxo[0]["locked"] is False
+
+    # Both Bitcoin Core and Spectrum exclude locked outputs from listunspent.
+    wallet.core_locked_outpoints.add(outpoint)
+    wallet.frozen_utxo.append(outpoint)
+    wallet._rpc.listunspent.return_value = []
+    wallet.check_utxo()
+
+    assert len(wallet.full_utxo) == 1
+    assert wallet.full_utxo[0]["locked"] is True
+    assert wallet.full_utxo[0]["address"] == ADDRESS_A
+    assert wallet.full_utxo[0]["amount"] == amount
+    assert {
+        "type": "output",
+        "ref": outpoint,
+        "label": "Alice",
+        "spendable": False,
+    } in parse_export(wallet)
+
+
+def test_locked_utxo_uses_actual_output_when_transaction_details_show_send():
+    """A negative send detail is not the locked, wallet-owned output."""
+    amount_sats = 38759
+    raw_tx = Transaction(
+        vin=[TransactionInput(bytes(32), 0)],
+        vout=[
+            TransactionOutput(amount_sats, script.address_to_scriptpubkey(ADDRESS_A))
+        ],
+    )
+    txid = raw_tx.txid().hex()
+    outpoint = f"{txid}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 1, "Alice"), make_address(ADDRESS_B, 0)]
+    )
+    wallet.check_utxo = MethodType(Wallet.check_utxo, wallet)
+    wallet.manager = SimpleNamespace(chain="main")
+    wallet._transactions = MagicMock()
+    wallet._transactions.get_transactions.return_value = [
+        {"txid": txid, "time": 1, "address": ADDRESS_B, "label": ""}
+    ]
+    wallet.core_locked_outpoints.add(outpoint)
+    wallet.frozen_utxo.append(outpoint)
+    wallet._rpc.listunspent.return_value = []
+    wallet._rpc.gettransaction.return_value = {
+        "details": [
+            {
+                "vout": 0,
+                "category": "send",
+                "address": ADDRESS_B,
+                "amount": -0.00039759,
+            }
+        ],
+        "hex": str(raw_tx),
+    }
+
+    wallet.check_utxo()
+
+    assert len(wallet.full_utxo) == 1
+    assert wallet.full_utxo[0]["address"] == ADDRESS_A
+    assert wallet.full_utxo[0]["amount"] == amount_sats * 1e-8
+    assert {
+        "type": "output",
+        "ref": outpoint,
+        "label": "Alice",
+        "spendable": False,
+    } in parse_export(wallet)
 
 
 def test_unknown_and_conflicting_outpoint_state_do_not_create_wallet_state():

@@ -959,27 +959,15 @@ class Wallet(AbstractWallet):
                 else:  # a locked output
                     # In the case of locked outputs, the listlockunspent call does not contain reasonable UTXO data,
                     # so we need to get the data from the original transaction.
+                    # gettransaction().details describes wallet accounting, not
+                    # necessarily the actual output. In particular, a SEND
+                    # detail can share a vout with a CHANGE output while having
+                    # a negative amount and a different address (Spectrum).
                     tx_from_core = self.rpc.gettransaction(tx_copy["txid"])
-                    searched_vout = next(
-                        (
-                            _tx
-                            for _tx in tx_from_core["details"]
-                            if _tx["vout"] == utxo_vout
-                        ),
-                        None,
-                    )
-
-                    if searched_vout:
-                        tx_copy["amount"] = searched_vout["amount"]
-                        tx_copy["address"] = searched_vout["address"]
-                    else:
-                        # Sometimes gettransaction doesn't include all outputs (for example it does not include change outputs).
-                        # In this case, we get the raw transaction and decode it using embit to get the additional data we need.
-                        raw_transaction_hex = tx_from_core["hex"]
-                        parsed_transaction = self.TxCls.from_string(raw_transaction_hex)
-                        out = parsed_transaction.vout[utxo_vout]
-                        tx_copy["amount"] = round(out.value * 1e-8, 8)
-                        tx_copy["address"] = out.script_pubkey.address(self.network)
+                    parsed_transaction = self.TxCls.from_string(tx_from_core["hex"])
+                    out = parsed_transaction.vout[utxo_vout]
+                    tx_copy["amount"] = round(out.value * 1e-8, 8)
+                    tx_copy["address"] = out.script_pubkey.address(self.network)
 
                 # Append the copy to the _full_utxo list
                 _full_utxo.append(tx_copy)
