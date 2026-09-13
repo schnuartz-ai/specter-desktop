@@ -13,7 +13,7 @@ from embit.liquid.addresses import to_unconfidential
 from embit.liquid.networks import NETWORKS
 from embit.liquid.transaction import LTransaction, LTransactionInput, LTransactionOutput
 from embit.transaction import Transaction, TransactionInput, TransactionOutput
-from flask import Flask
+from flask import Flask, url_for
 
 from cryptoadvance.specter.liquid.addresslist import LAddress, LAddressList
 from cryptoadvance.specter.liquid.wallet import LWallet
@@ -306,6 +306,28 @@ def test_bip329_download_is_separate_utf8_jsonl_attachment():
     assert "München ₿" in response.get_data(as_text=True)
 
 
+def test_existing_wallet_settings_endpoint_resolves_to_settings_page():
+    flask_app = Flask(__name__)
+    flask_app.register_blueprint(wallets_module.wallets_endpoint)
+
+    with flask_app.test_request_context():
+        assert url_for("wallets_endpoint.settings", wallet_alias="savings") == (
+            "/wallet/savings/settings/"
+        )
+        assert (
+            url_for(
+                "wallets_endpoint.settings",
+                wallet_alias="savings",
+                rescan_blockchain=True,
+            )
+            == "/wallet/savings/settings/?rescan_blockchain=True"
+        )
+        assert (
+            url_for("wallets_endpoint.settings_rescan_get", wallet_alias="savings")
+            == "/wallet/savings/settings/rescan"
+        )
+
+
 def test_warning_only_bip329_import_is_not_flashed_as_success(monkeypatch):
     wallet = make_wallet([make_address(ADDRESS_A, 0)])
     flashes = []
@@ -343,7 +365,7 @@ def test_warning_only_bip329_import_is_not_flashed_as_success(monkeypatch):
     assert flashes[0][0] == "warning"
     assert "not imported" in flashes[0][1]
     assert not any(message.startswith("Successfully") for category, message in flashes)
-    assert built_endpoints == ["wallets_endpoint.settings_page"]
+    assert built_endpoints == ["wallets_endpoint.settings"]
     assert response.location == "/wallet/{}/settings".format(wallet.alias)
 
 
@@ -646,6 +668,59 @@ def test_legacy_freeze_toggle_uses_the_wallet_utxo_state_lock():
     assert toggle_finished.is_set()
     assert wallet.frozen_utxo == [outpoint]
     assert wallet.core_locked_outpoints == {outpoint}
+
+
+def test_legacy_ui_unfreeze_preserves_pending_psbt_lock():
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": True}],
+        frozen=[outpoint],
+    )
+    wallet.pending_psbts = {
+        "pending": SimpleNamespace(utxo_dict=lambda: [{"txid": TXID_A, "vout": 0}])
+    }
+
+    with pytest.raises(FrozenStateConflictError, match="pending PSBT input"):
+        wallet.toggle_freeze_utxo([outpoint])
+
+    assert wallet.frozen_utxo == [outpoint]
+    assert wallet.core_locked_outpoints == {outpoint}
+    assert wallet.commit_calls == 0
+    wallet._rpc.lockunspent.assert_not_called()
+
+
+@pytest.mark.parametrize("initially_frozen", [False, True])
+@pytest.mark.parametrize("rpc_failure", ["exception", "false"])
+def test_legacy_ui_toggle_rpc_failure_keeps_core_and_local_state(
+    initially_frozen, rpc_failure
+):
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0)],
+        [
+            {
+                "txid": TXID_A,
+                "vout": 0,
+                "address": ADDRESS_A,
+                "locked": initially_frozen,
+            }
+        ],
+        frozen=[outpoint] if initially_frozen else [],
+    )
+    if rpc_failure == "exception":
+        wallet.lockunspent_error = RuntimeError("simulated RPC failure")
+    else:
+        wallet._rpc.lockunspent.side_effect = None
+        wallet._rpc.lockunspent.return_value = False
+
+    with pytest.raises(SpecterError, match="frozen UTXO state"):
+        wallet.toggle_freeze_utxo([outpoint])
+
+    assert (outpoint in wallet.frozen_utxo) == initially_frozen
+    assert (outpoint in wallet.core_locked_outpoints) == initially_frozen
+    assert wallet.commit_calls == 0
+    wallet._rpc.lockunspent.assert_called_once()
 
 
 def test_pending_psbt_save_is_serialized_against_freeze():

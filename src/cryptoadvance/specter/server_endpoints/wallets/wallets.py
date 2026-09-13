@@ -413,7 +413,10 @@ def history(wallet_alias):
     if request.method == "POST":
         action = request.form["action"]
         if action == "freezeutxo":
-            wallet.toggle_freeze_utxo(request.form.getlist("selected_utxo"))
+            try:
+                wallet.toggle_freeze_utxo(request.form.getlist("selected_utxo"))
+            except SpecterError as e:
+                flash(str(e), "error")
             tx_list_type = "utxo"
         elif action == "abandon_tx":
             txid = request.form["txid"]
@@ -785,19 +788,34 @@ def addresses(wallet_alias):
 @wallets_endpoint.route(
     "/wallet/<wallet_alias>/settings/",
     methods=["GET", "POST"],
-    endpoint="settings_page",
 )
 # In case of exceptions in the "subactions" POST method handlers, the error-handler
 # will redirect to the same endpoint but GET-method. Specifying them here:
 @wallets_endpoint.route(
-    "/wallet/<wallet_alias>/settings/importaddresslabels", methods=["GET"]
+    "/wallet/<wallet_alias>/settings/importaddresslabels",
+    methods=["GET"],
+    endpoint="settings_importaddresslabels_get",
 )
 @wallets_endpoint.route(
-    "/wallet/<wallet_alias>/settings/keypoolrefill", methods=["GET"]
+    "/wallet/<wallet_alias>/settings/keypoolrefill",
+    methods=["GET"],
+    endpoint="settings_keypoolrefill_get",
 )
-@wallets_endpoint.route("/wallet/<wallet_alias>/settings/rescan", methods=["GET"])
-@wallets_endpoint.route("/wallet/<wallet_alias>/settings/deletewallet", methods=["GET"])
-@wallets_endpoint.route("/wallet/<wallet_alias>/settings/clearcache", methods=["GET"])
+@wallets_endpoint.route(
+    "/wallet/<wallet_alias>/settings/rescan",
+    methods=["GET"],
+    endpoint="settings_rescan_get",
+)
+@wallets_endpoint.route(
+    "/wallet/<wallet_alias>/settings/deletewallet",
+    methods=["GET"],
+    endpoint="settings_deletewallet_get",
+)
+@wallets_endpoint.route(
+    "/wallet/<wallet_alias>/settings/clearcache",
+    methods=["GET"],
+    endpoint="settings_clearcache_get",
+)
 @login_required
 def settings(wallet_alias):
     wallet: Wallet = app.specter.wallet_manager.get_by_alias(wallet_alias)
@@ -877,18 +895,14 @@ def settings_importaddresslabels(wallet_alias):
                 _("No wallet labels or frozen UTXO states needed updating."),
                 "warning",
             )
-        return redirect(
-            url_for("wallets_endpoint.settings_page", wallet_alias=wallet_alias)
-        )
+        return redirect(url_for("wallets_endpoint.settings", wallet_alias=wallet_alias))
     if imported_addresses_len > 1:
         flash(f"Successfully imported {imported_addresses_len} address labels.")
     elif imported_addresses_len == 1:
         flash(f"Successfully imported {imported_addresses_len} address label.")
     else:
         flash("No address labels were imported.")
-    return redirect(
-        url_for("wallets_endpoint.settings_page", wallet_alias=wallet_alias)
-    )
+    return redirect(url_for("wallets_endpoint.settings", wallet_alias=wallet_alias))
 
 
 @wallets_endpoint.route(

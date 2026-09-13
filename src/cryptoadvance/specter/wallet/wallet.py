@@ -1343,39 +1343,19 @@ class Wallet(AbstractWallet):
 
     def toggle_freeze_utxo(self, utxo_list):
         with self._utxo_state_lock:
-            return self._toggle_freeze_utxo(utxo_list)
-
-    def _toggle_freeze_utxo(self, utxo_list):
-        # utxo = ["txid:vout", "txid:vout"]
-        utxo_list_done = []  # Preventing Duplicates server-side
-        for utxo in utxo_list:
-            if utxo in utxo_list_done:
-                continue
-            if utxo in self.frozen_utxo:
-                try:
-                    self.rpc.lockunspent(
-                        True,
-                        [{"txid": utxo.split(":")[0], "vout": int(utxo.split(":")[1])}],
-                    )
-                except Exception as e:
-                    # UTXO was spent ?!
-                    logger.exception(e)
-                logger.info("Unfroze a wallet UTXO")
-                self.frozen_utxo.remove(utxo)
-            else:
-                try:
-                    self.rpc.lockunspent(
-                        False,
-                        [{"txid": utxo.split(":")[0], "vout": int(utxo.split(":")[1])}],
-                    )
-                except Exception:
-                    # UTXO was spent
-                    logger.debug("Failed to lock a wallet UTXO")
-                logger.info("Froze a wallet UTXO")
-                self.frozen_utxo.append(utxo)
-            utxo_list_done.append(utxo)
-
-        self.save_to_file()
+            seen = set()
+            for ref in utxo_list:
+                outpoint = normalize_outpoint(ref)
+                if outpoint is None:
+                    raise SpecterError("Invalid frozen UTXO state request")
+                if outpoint in seen:
+                    continue
+                seen.add(outpoint)
+                locally_frozen = any(
+                    normalize_outpoint(frozen_ref) == outpoint
+                    for frozen_ref in self.frozen_utxo
+                )
+                self.set_frozen_state(outpoint, not locally_frozen)
 
     def update_pending_psbt(self, psbt, txid, raw):
         with self._utxo_state_lock:
