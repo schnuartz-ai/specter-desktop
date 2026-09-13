@@ -6,10 +6,17 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from embit import ec
 from embit import script
+from embit.liquid.addresses import address as liquid_address
+from embit.liquid.addresses import to_unconfidential
+from embit.liquid.networks import NETWORKS
+from embit.liquid.transaction import LTransaction, LTransactionInput, LTransactionOutput
 from embit.transaction import Transaction, TransactionInput, TransactionOutput
 from flask import Flask
 
+from cryptoadvance.specter.liquid.addresslist import LAddress, LAddressList
+from cryptoadvance.specter.liquid.wallet import LWallet
 from cryptoadvance.specter.server_endpoints.wallets import wallets as wallets_module
 from cryptoadvance.specter.server_endpoints.wallets.wallets import (
     settings_importaddresslabels,
@@ -66,6 +73,10 @@ class StubWallet(Wallet):
         return 100
 
 
+class StubLiquidWallet(LWallet, StubWallet):
+    pass
+
+
 def make_address(address, index, label=None, change=False):
     return Address(
         MagicMock(),
@@ -78,8 +89,8 @@ def make_address(address, index, label=None, change=False):
     )
 
 
-def make_wallet(addresses, utxos=None, frozen=None):
-    wallet = StubWallet.__new__(StubWallet)
+def make_wallet(addresses, utxos=None, frozen=None, wallet_cls=StubWallet):
+    wallet = wallet_cls.__new__(wallet_cls)
     wallet._addresses = StubAddressList(
         {address.address: address for address in addresses}
     )
@@ -1254,6 +1265,121 @@ def test_locked_utxo_uses_actual_output_when_transaction_details_show_send():
         "label": "Alice",
         "spendable": False,
     } in parse_export(wallet)
+
+
+def make_locked_confidential_liquid_wallet():
+    amount_sats = 38759
+    output_script = script.address_to_scriptpubkey(ADDRESS_A)
+    blinding_key = ec.PrivateKey(bytes([1]) * 32).get_public_key()
+    address = liquid_address(output_script, blinding_key, NETWORKS["liquidtestnet"])
+    other_address = liquid_address(
+        script.address_to_scriptpubkey(ADDRESS_B),
+        blinding_key,
+        NETWORKS["liquidtestnet"],
+    )
+    raw_tx = LTransaction(
+        vin=[LTransactionInput(bytes(32), 0)],
+        vout=[
+            LTransactionOutput(bytes(32), bytes([8]) + bytes([2]) * 32, output_script)
+        ],
+    )
+    assert not isinstance(raw_tx.vout[0].value, int)
+    txid = raw_tx.txid().hex()
+    outpoint = f"{txid}:0"
+    wallet = make_wallet(
+        [make_address(address, 0, "Liquid reserve")], wallet_cls=StubLiquidWallet
+    )
+    liquid_addresses = LAddressList("unused-liquid-addresses.csv", wallet._rpc)
+    liquid_addresses[address] = LAddress(
+        wallet._rpc,
+        address=address,
+        index=0,
+        change=False,
+        label="Liquid reserve",
+        used=True,
+        service_id=None,
+    )
+    liquid_addresses._update_scripts()
+    wallet._addresses = liquid_addresses
+    wallet.check_utxo = MethodType(Wallet.check_utxo, wallet)
+    wallet.manager = SimpleNamespace(chain="liquidtestnet")
+    wallet._transactions = MagicMock()
+    wallet._transactions.get_transactions.return_value = [
+        {"txid": txid, "time": 1, "address": address, "label": "Liquid reserve"}
+    ]
+    wallet.core_locked_outpoints.add(outpoint)
+    wallet.frozen_utxo.append(outpoint)
+    wallet._rpc.listunspent.return_value = []
+    return wallet, raw_tx, address, other_address, outpoint, amount_sats
+
+
+def test_locked_confidential_liquid_utxo_uses_unblinded_wallet_detail():
+    (
+        wallet,
+        raw_tx,
+        address,
+        other_address,
+        outpoint,
+        amount_sats,
+    ) = make_locked_confidential_liquid_wallet()
+    wallet._rpc.gettransaction.return_value = {
+        "hex": str(raw_tx),
+        "details": [
+            {
+                "vout": 0,
+                "category": "send",
+                "address": other_address,
+                "amount": -0.00039759,
+            },
+            {
+                "vout": 0,
+                "category": "receive",
+                "address": address,
+                "amount": amount_sats * 1e-8,
+            },
+        ],
+    }
+    wallet._rpc.decoderawtransaction.side_effect = AssertionError(
+        "Wallet detail already supplies the unblinded output"
+    )
+
+    wallet.check_utxo()
+
+    assert len(wallet.full_utxo) == 1
+    assert wallet.full_utxo[0]["address"] == address
+    assert wallet.full_utxo[0]["amount"] == amount_sats * 1e-8
+    assert {
+        "type": "output",
+        "ref": outpoint,
+        "label": "Liquid reserve",
+        "spendable": False,
+    } in parse_export(wallet)
+
+
+def test_locked_confidential_liquid_change_uses_unblinding_decoder():
+    (
+        wallet,
+        raw_tx,
+        address,
+        _,
+        _,
+        amount_sats,
+    ) = make_locked_confidential_liquid_wallet()
+    wallet._rpc.gettransaction.return_value = {"hex": str(raw_tx), "details": []}
+    wallet._rpc.decoderawtransaction.return_value = {
+        "vout": [
+            {
+                "value": amount_sats * 1e-8,
+                "scriptPubKey": {"addresses": [to_unconfidential(address)]},
+            }
+        ]
+    }
+
+    wallet.check_utxo()
+
+    assert wallet.full_utxo[0]["address"] == address
+    assert wallet.full_utxo[0]["amount"] == amount_sats * 1e-8
+    wallet._rpc.decoderawtransaction.assert_called_once_with(str(raw_tx))
 
 
 def test_unknown_and_conflicting_outpoint_state_do_not_create_wallet_state():

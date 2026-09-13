@@ -854,6 +854,12 @@ class Wallet(AbstractWallet):
         self.info = self.rpc.getwalletinfo()
         return self.info
 
+    def _get_locked_utxo_address_amount(self, tx_from_core, vout):
+        """Read the actual outpoint; accounting details can describe another output."""
+        parsed_transaction = self.TxCls.from_string(tx_from_core["hex"])
+        out = parsed_transaction.vout[vout]
+        return round(out.value * 1e-8, 8), out.script_pubkey.address(self.network)
+
     def check_utxo(self):
         """fetches the utxo-set from core and stores the result in self.__full_utxo which is
         a List[WalletAwareTxItem] enriched with utxo specific data:
@@ -959,15 +965,11 @@ class Wallet(AbstractWallet):
                 else:  # a locked output
                     # In the case of locked outputs, the listlockunspent call does not contain reasonable UTXO data,
                     # so we need to get the data from the original transaction.
-                    # gettransaction().details describes wallet accounting, not
-                    # necessarily the actual output. In particular, a SEND
-                    # detail can share a vout with a CHANGE output while having
-                    # a negative amount and a different address (Spectrum).
                     tx_from_core = self.rpc.gettransaction(tx_copy["txid"])
-                    parsed_transaction = self.TxCls.from_string(tx_from_core["hex"])
-                    out = parsed_transaction.vout[utxo_vout]
-                    tx_copy["amount"] = round(out.value * 1e-8, 8)
-                    tx_copy["address"] = out.script_pubkey.address(self.network)
+                    (
+                        tx_copy["amount"],
+                        tx_copy["address"],
+                    ) = self._get_locked_utxo_address_amount(tx_from_core, utxo_vout)
 
                 # Append the copy to the _full_utxo list
                 _full_utxo.append(tx_copy)
