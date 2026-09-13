@@ -867,6 +867,11 @@ class Wallet(AbstractWallet):
         * item["vout"] to enable its use in coinselection
         * item["amount"] is the amount of the utxo
         """
+        with self._utxo_state_lock:
+            self._check_utxo_locked()
+
+    def _check_utxo_locked(self):
+        """Refresh the UTXO cache while holding the wallet's UTXO-state lock."""
         _full_utxo = []
         try:
             # listunspent only lists not locked utxos
@@ -1523,7 +1528,11 @@ class Wallet(AbstractWallet):
         Output labels are derived from raw stored address labels. Display-only
         fallbacks such as ``Address #4`` and ``Change #8`` are never exported.
         """
+        with self._utxo_state_lock:
+            return self._export_bip329_labels_locked()
 
+    def _export_bip329_labels_locked(self):
+        """Refresh and serialize one consistent wallet UTXO-state snapshot."""
         # full_utxo is a lazy cache. Refresh it so the interoperability export
         # reflects the wallet's current outputs and Core lock state.
         self.check_utxo()

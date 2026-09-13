@@ -219,6 +219,75 @@ def test_export_labeled_and_frozen_outputs_as_deterministic_jsonl():
     assert "Change #8" not in wallet.export_bip329_labels()
 
 
+def test_bip329_export_snapshot_blocks_concurrent_freeze():
+    outpoint = f"{TXID_A}:0"
+    wallet = make_wallet(
+        [make_address(ADDRESS_A, 0, "Alice")],
+        [{"txid": TXID_A, "vout": 0, "address": ADDRESS_A, "locked": False}],
+    )
+    export_refreshed_utxos = threading.Event()
+    allow_export_to_finish = threading.Event()
+    freeze_started = threading.Event()
+    freeze_reached_core = threading.Event()
+    original_check_utxo = wallet.check_utxo
+    original_listlockunspent = wallet._rpc.listlockunspent.side_effect
+    results = {}
+    errors = []
+
+    def paused_check_utxo():
+        original_check_utxo()
+        export_refreshed_utxos.set()
+        if not allow_export_to_finish.wait(timeout=5):
+            raise RuntimeError("test timed out waiting to resume export")
+
+    def observed_listlockunspent():
+        if threading.current_thread().name == "concurrent-export-freeze":
+            freeze_reached_core.set()
+        return original_listlockunspent()
+
+    def export():
+        try:
+            results["records"] = parse_export(wallet)
+        except Exception as e:
+            errors.append(e)
+
+    def freeze():
+        freeze_started.set()
+        try:
+            results["freeze"] = wallet.set_frozen_state(outpoint, True)
+        except Exception as e:
+            errors.append(e)
+
+    wallet.check_utxo = paused_check_utxo
+    wallet._rpc.listlockunspent.side_effect = observed_listlockunspent
+    export_thread = threading.Thread(target=export, name="concurrent-export")
+    freeze_thread = threading.Thread(target=freeze, name="concurrent-export-freeze")
+    try:
+        export_thread.start()
+        assert export_refreshed_utxos.wait(timeout=5)
+        freeze_thread.start()
+        assert freeze_started.wait(timeout=5)
+        assert not freeze_reached_core.wait(timeout=0.2)
+    finally:
+        allow_export_to_finish.set()
+        export_thread.join(timeout=5)
+        if freeze_thread.ident is not None:
+            freeze_thread.join(timeout=5)
+
+    assert not export_thread.is_alive()
+    assert not freeze_thread.is_alive()
+    assert errors == []
+    assert results == {
+        "records": [
+            {"type": "addr", "ref": ADDRESS_A, "label": "Alice"},
+            {"type": "output", "ref": outpoint, "label": "Alice"},
+        ],
+        "freeze": True,
+    }
+    assert freeze_reached_core.is_set()
+    assert wallet.frozen_utxo == [outpoint]
+
+
 def test_bip329_download_is_separate_utf8_jsonl_attachment():
     wallet = make_wallet([make_address(ADDRESS_A, 0, "München ₿")])
     wallet.alias = "savings_wallet"
